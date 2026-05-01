@@ -14,6 +14,9 @@
 
 set -e
 
+# Volume mounts as root at runtime — fix ownership so mosquitto user can write
+chown -R mosquitto:mosquitto /mosquitto/data /mosquitto/log 2>/dev/null || true
+
 CERT_DIR="/mosquitto/certs"
 CA_CRT="$CERT_DIR/ca.crt"
 SERVER_CRT="$CERT_DIR/server.crt"
