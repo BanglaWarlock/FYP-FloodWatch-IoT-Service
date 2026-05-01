@@ -14,7 +14,7 @@
 name: First-time Fly.io setup
 
 on:
-  workflow_dispatch:   # manual trigger only — never auto-runs
+  workflow_dispatch:
 
 jobs:
   setup:
@@ -26,17 +26,17 @@ jobs:
 
       - name: Create Fly.io app (skips if already exists)
         run: |
-          fly apps list | grep -q "flood-mqtt-fyp" \
+          flyctl apps list | grep -q "flood-mqtt-fyp" \
             && echo "App already exists, skipping create" \
-            || fly apps create flood-mqtt-fyp
+            || flyctl apps create flood-mqtt-fyp
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
       - name: Create persistent volume in Singapore (skips if exists)
         run: |
-          fly volumes list --app flood-mqtt-fyp | grep -q "mosquitto_data" \
+          flyctl volumes list --app flood-mqtt-fyp | grep -q "mosquitto_data" \
             && echo "Volume already exists, skipping create" \
-            || fly volumes create mosquitto_data \
+            || flyctl volumes create mosquitto_data \
                 --region sin \
                 --size 1 \
                 --app flood-mqtt-fyp \
@@ -45,14 +45,10 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
       - name: Deploy initial broker
-        run: fly deploy --app flood-mqtt-fyp --config fly.toml --remote-only
+        run: flyctl deploy --app flood-mqtt-fyp --config fly.toml --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
       - name: Print result
         run: |
-          echo ""
-          echo "Setup complete. Broker is live at:"
-          echo "  flood-mqtt-fyp.fly.dev:1883"
-          echo ""
-          echo "View logs: go to fly.io/apps/flood-mqtt-fyp/monitoring"
+          echo "Broker is live at: flood-mqtt-fyp.fly.dev:1883"
