@@ -35,7 +35,7 @@ jobs:
       - name: Create persistent volume in Singapore (skips if exists)
         run: |
           flyctl volumes list --app suts-fyp-floodwatch-mqtt | grep -q "mosquitto_data" \
-            ...
+            && echo "Volume already exists, skipping" \
             || flyctl volumes create mosquitto_data \
                 --region sin \
                 --size 1 \
@@ -47,7 +47,7 @@ jobs:
       - name: Deploy initial broker
         run: |
           flyctl deploy \
-            --app flood-mqtt-fyp \
+            --app suts-fyp-floodwatch-mqtt \
             --config fly.toml \
             --ha=false
         env:
@@ -55,4 +55,4 @@ jobs:
 
       - name: Print result
         run: |
-          echo "Broker is live at: flood-mqtt-fyp.fly.dev:1883"
+          echo "Broker is live at: suts-fyp-floodwatch-mqtt.fly.dev:1883"
