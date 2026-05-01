@@ -44,6 +44,28 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
+      - name: Ensure dedicated IPv4 (release shared if present, allocate dedicated)
+        run: |
+          IPS=$(flyctl ips list --app suts-fyp-floodwatch-mqtt --json)
+
+          DEDICATED=$(echo "$IPS" | jq -r '.[] | select(.type=="public" and .version=="v4") | .address' | head -1)
+          if [ -n "$DEDICATED" ]; then
+            echo "Dedicated IPv4 already exists: $DEDICATED, skipping"
+          else
+            SHARED=$(echo "$IPS" | jq -r '.[] | select(.type=="shared_v4") | .address' | head -1)
+            if [ -n "$SHARED" ]; then
+              echo "Releasing shared IPv4: $SHARED"
+              flyctl ips release "$SHARED" --app suts-fyp-floodwatch-mqtt
+            fi
+            echo "Allocating dedicated IPv4..."
+            flyctl ips allocate-v4 --app suts-fyp-floodwatch-mqtt
+          fi
+
+          echo "Current IPs:"
+          flyctl ips list --app suts-fyp-floodwatch-mqtt
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
       - name: Deploy initial broker
         run: |
           flyctl deploy \
@@ -61,7 +83,7 @@ jobs:
             echo "Setting auto-stop=off on machine $ID"
             flyctl machine update "$ID" \
               --app suts-fyp-floodwatch-mqtt \
-              --auto-stop=off \
+              --autostop=off \
               --yes
           done
         env:
