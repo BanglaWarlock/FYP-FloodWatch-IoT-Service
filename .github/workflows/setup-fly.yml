@@ -58,7 +58,7 @@ jobs:
               flyctl ips release "$SHARED" --app suts-fyp-floodwatch-mqtt
             fi
             echo "Allocating dedicated IPv4..."
-            flyctl ips allocate-v4 --app suts-fyp-floodwatch-mqtt
+            flyctl ips allocate-v4 --app suts-fyp-floodwatch-mqtt --yes
           fi
 
           echo "Current IPs:"
