@@ -1,0 +1,30 @@
+name: Destroy test region broker
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Region to destroy'
+        required: true
+        type: choice
+        options:
+          - sin
+          - hkg
+          - bom
+          - nrt
+          - syd
+          - lax
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Destroy test broker
+        run: |
+          APP="flood-mqtt-test-${{ inputs.region }}"
+          flyctl apps destroy "$APP" --yes
+          echo "Destroyed: $APP"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

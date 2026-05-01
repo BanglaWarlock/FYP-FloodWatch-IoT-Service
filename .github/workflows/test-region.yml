@@ -1,0 +1,100 @@
+# ============================================================
+#  test-region.yml
+#
+#  Manual trigger only — never auto-runs on push.
+#
+#  How to use:
+#    1. Actions tab → "Deploy broker to test region"
+#    2. "Run workflow" → pick a region → Run
+#    3. Wait ~90 seconds for deploy to complete
+#    4. Run: python scripts/test-region-latency.py
+#    5. Compare results — pick the winning region
+#
+#  To clean up a test region (stop billing):
+#    fly apps destroy flood-mqtt-test-hkg --yes
+# ============================================================
+
+name: Deploy broker to test region
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Fly.io region to test'
+        required: true
+        default: 'sin'
+        type: choice
+        options:
+          - sin   # Singapore
+          - hkg   # Hong Kong
+          - bom   # Mumbai
+          - nrt   # Tokyo
+          - syd   # Sydney
+          - lax   # Los Angeles (long baseline)
+
+jobs:
+  deploy-region-test:
+    name: Deploy to ${{ inputs.region }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Set app name
+        id: names
+        run: echo "app=flood-mqtt-test-${{ inputs.region }}" >> $GITHUB_OUTPUT
+
+      - name: Create app (skips if exists)
+        run: |
+          flyctl apps list | grep -q "${{ steps.names.outputs.app }}" \
+            && echo "App exists, skipping" \
+            || flyctl apps create "${{ steps.names.outputs.app }}"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Create volume (skips if exists)
+        run: |
+          flyctl volumes list --app "${{ steps.names.outputs.app }}" \
+            | grep -q "mosquitto_data" \
+            && echo "Volume exists, skipping" \
+            || flyctl volumes create mosquitto_data \
+                --region ${{ inputs.region }} \
+                --size 1 \
+                --app "${{ steps.names.outputs.app }}" \
+                --yes
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Deploy to region
+        run: |
+          flyctl deploy \
+            --app "${{ steps.names.outputs.app }}" \
+            --config fly.${{ inputs.region }}.toml \
+            --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Print test instructions
+        run: |
+          echo ""
+          echo "======================================================"
+          echo "  Broker deployed to ${{ inputs.region }}"
+          echo "======================================================"
+          echo ""
+          echo "  Host: ${{ steps.names.outputs.app }}.fly.dev"
+          echo "  Port: 1883"
+          echo ""
+          echo "  Run latency test from your machine:"
+          echo "    pip install paho-mqtt"
+          echo "    python scripts/test-region-latency.py"
+          echo ""
+          echo "  To test a single broker:"
+          echo "    python scripts/test-region-latency.py \\"
+          echo "      --broker ${{ steps.names.outputs.app }}.fly.dev"
+          echo ""
+          echo "  To clean up after testing:"
+          echo "    fly apps destroy ${{ steps.names.outputs.app }} --yes"
+          echo "======================================================"
+
+          fly apps destroy flood-mqtt-test-hkg --yes

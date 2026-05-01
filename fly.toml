@@ -1,0 +1,56 @@
+# ============================================================
+#  fly.toml  —  Mosquitto MQTT broker on Fly.io
+#
+#  Phase 1: open port 1883, no TLS
+#  Phase 2: change internal_port to 8883, change services.ports
+#           to 8883, rebuild image with certs. No other changes.
+# ============================================================
+
+app            = "suts-fyp-floodwatch-mqtt"   # must be globally unique on Fly.io
+primary_region = "sin"              # Singapore — closest to Sarawak
+
+[build]
+  dockerfile = "mosquitto/Dockerfile.flyio"
+
+# Persistent volume — stores retained messages across restarts
+[mounts]
+  source      = "mosquitto_data"
+  destination = "/mosquitto/data"
+
+# ── Phase 1: port 1883 (open) ──────────────────────────────
+[[services]]
+  internal_port      = 1883
+  protocol           = "tcp"
+  auto_stop_machines = false    # CRITICAL — broker must never sleep
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 1883
+    # No handlers — raw TCP passthrough, not HTTP
+
+  [[services.tcp_checks]]
+    interval     = "10s"
+    timeout      = "2s"
+    grace_period = "30s"   # give Mosquitto time to fully start
+
+# ── Phase 2: replace the [[services]] block above with this ─
+# [[services]]
+#   internal_port      = 8883
+#   protocol           = "tcp"
+#   auto_stop_machines = false
+#   auto_start_machines = true
+#   min_machines_running = 1
+#
+#   [[services.ports]]
+#     port = 8883
+#
+#   [[services.tcp_checks]]
+#     interval     = "10s"
+#     timeout      = "2s"
+#     grace_period = "30s"
+
+[[vm]]
+  memory   = "256mb"    # Mosquitto is lightweight — this is plenty
+  cpu_kind = "shared"
+  cpus     = 1

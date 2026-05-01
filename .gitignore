@@ -1,0 +1,9 @@
+# MQTT certificates — never commit private keys
+mosquitto/certs/
+*.key
+*.csr
+
+# Environment files
+.env
+.env.*
+!.env.example

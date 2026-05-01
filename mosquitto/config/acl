@@ -1,0 +1,31 @@
+# ============================================================
+#  acl  —  per-client topic permissions
+#  Only active when allow_anonymous false (Phase 2 TLS mode)
+#
+#  topic structure: 99088809/FYP_flood/<type>
+# ============================================================
+
+# Parser service — needs to read sensor data, write refresh acks
+user parser
+topic readwrite 99088809/#
+
+# Simulator — publishes heartbeats and float alerts only
+user simulator
+topic write 99088809/FYP_flood/heartbeats
+topic write 99088809/FYP_flood/floatalerts
+
+# Health checker — reads node status, writes alerts
+user health-checker
+topic read 99088809/FYP_flood/heartbeats
+topic read 99088809/FYP_flood/floatalerts
+topic write 99088809/FYP_flood/refresh
+
+# ESP32 master node — publishes upward, listens for commands
+user esp32
+topic write 99088809/FYP_flood/heartbeats
+topic write 99088809/FYP_flood/floatalerts
+topic read  99088809/FYP_flood/refresh
+
+# C# listener (same rights as parser)
+user csharp_listener
+topic readwrite 99088809/#

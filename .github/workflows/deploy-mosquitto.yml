@@ -1,0 +1,44 @@
+# ============================================================
+#  deploy-mosquitto.yml
+#
+#  Triggers: push to main that changes mosquitto/** or fly.toml
+#  Does:     builds the Dockerfile.flyio on Fly.io's infra,
+#            replaces the running broker with the new image
+#
+#  To test it: edit mosquitto/config/mosquitto.conf
+#  (e.g. change log_type), commit, push. Watch Actions tab.
+# ============================================================
+
+name: Deploy MQTT broker to Fly.io
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mosquitto/**'    # any file in mosquitto/ directory
+      - 'fly.toml'        # broker's deploy config
+
+jobs:
+  deploy:
+    name: Deploy broker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly.io
+        run: |
+          flyctl deploy \
+            --app suts-fyp-floodwatch-mqtt \
+            --config fly.toml \
+            --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Verify broker is up
+        run: |
+          sleep 15
+          timeout 10 bash -c "echo > /dev/tcp/suts-fyp-floodwatch-mqtt.fly.dev/1883" \
+            && echo "✓ Broker reachable on port 1883" \
+            || (echo "✗ TCP check failed" && exit 1)

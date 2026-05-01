@@ -26,20 +26,20 @@ jobs:
 
       - name: Create Fly.io app (skips if already exists)
         run: |
-          flyctl apps list | grep -q "flood-mqtt-fyp" \
+          flyctl apps list | grep -q "suts-fyp-floodwatch-mqtt" \
             && echo "App already exists, skipping create" \
-            || flyctl apps create flood-mqtt-fyp
+            || flyctl apps create suts-fyp-floodwatch-mqtt
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
       - name: Create persistent volume in Singapore (skips if exists)
         run: |
-          flyctl volumes list --app flood-mqtt-fyp | grep -q "mosquitto_data" \
-            && echo "Volume already exists, skipping create" \
+          flyctl volumes list --app suts-fyp-floodwatch-mqtt | grep -q "mosquitto_data" \
+            ...
             || flyctl volumes create mosquitto_data \
                 --region sin \
                 --size 1 \
-                --app flood-mqtt-fyp \
+                --app suts-fyp-floodwatch-mqtt \
                 --yes
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

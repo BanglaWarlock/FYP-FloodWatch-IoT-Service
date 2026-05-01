@@ -1,0 +1,37 @@
+# ============================================================
+#  mosquitto/Dockerfile.flyio
+#
+#  Phase 1: open broker, port 1883, no auth
+#  Phase 2: uncomment the three COPY cert lines below,
+#           run scripts/gen-certs.sh, rebuild + redeploy.
+#           The entrypoint auto-detects and switches config.
+# ============================================================
+
+FROM eclipse-mosquitto:2
+
+# Copy both configs into the image — entrypoint picks the right one at runtime
+COPY config/mosquitto.conf     /mosquitto/config/mosquitto.conf
+COPY config/mosquitto-tls.conf /mosquitto/config/mosquitto-tls.conf
+COPY config/acl                /mosquitto/config/acl
+
+# ── Phase 2: Uncomment these three lines when certs are ready ──────────────
+# COPY certs/ca.crt     /mosquitto/certs/ca.crt
+# COPY certs/server.crt /mosquitto/certs/server.crt
+# COPY certs/server.key /mosquitto/certs/server.key
+# ──────────────────────────────────────────────────────────────────────────
+
+# Smart entrypoint — selects config based on cert presence
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+# Create required directories with correct ownership
+# eclipse-mosquitto image runs as user 'mosquitto' (UID 1883)
+RUN mkdir -p /mosquitto/certs /mosquitto/data /mosquitto/log && \
+    chown -R mosquitto:mosquitto /mosquitto/certs \
+                                  /mosquitto/data \
+                                  /mosquitto/log
+
+# Expose both ports — 1883 is active now, 8883 ready for Phase 2
+EXPOSE 1883 8883
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
