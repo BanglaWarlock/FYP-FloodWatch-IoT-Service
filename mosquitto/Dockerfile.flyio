@@ -10,18 +10,18 @@
 FROM eclipse-mosquitto:2
 
 # Copy both configs into the image — entrypoint picks the right one at runtime
-COPY config/mosquitto.conf     /mosquitto/config/mosquitto.conf
-COPY config/mosquitto-tls.conf /mosquitto/config/mosquitto-tls.conf
-COPY config/acl                /mosquitto/config/acl
+COPY mosquitto/config/mosquitto.conf     /mosquitto/config/mosquitto.conf
+COPY mosquitto/config/mosquitto-tls.conf /mosquitto/config/mosquitto-tls.conf
+COPY mosquitto/config/acl                /mosquitto/config/acl
 
 # ── Phase 2: Uncomment these three lines when certs are ready ──────────────
-# COPY certs/ca.crt     /mosquitto/certs/ca.crt
-# COPY certs/server.crt /mosquitto/certs/server.crt
-# COPY certs/server.key /mosquitto/certs/server.key
+# COPY mosquitto/certs/ca.crt     /mosquitto/certs/ca.crt
+# COPY mosquitto/certs/server.crt /mosquitto/certs/server.crt
+# COPY mosquitto/certs/server.key /mosquitto/certs/server.key
 # ──────────────────────────────────────────────────────────────────────────
 
 # Smart entrypoint — selects config based on cert presence
-COPY docker-entrypoint.sh /docker-entrypoint.sh
+COPY mosquitto/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 # Create required directories with correct ownership
