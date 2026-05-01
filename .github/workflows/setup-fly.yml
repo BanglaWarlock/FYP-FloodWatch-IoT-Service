@@ -53,6 +53,49 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
+      - name: Disable auto-stop on all machines
+        run: |
+          MACHINE_IDS=$(flyctl machine list --app suts-fyp-floodwatch-mqtt --json \
+            | jq -r '.[].id')
+          for ID in $MACHINE_IDS; do
+            echo "Setting auto-stop=off on machine $ID"
+            flyctl machine update "$ID" \
+              --app suts-fyp-floodwatch-mqtt \
+              --auto-stop=off \
+              --yes
+          done
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Wait for machine to start then confirm it stays up
+        run: |
+          echo "Waiting for machine to reach 'started' state..."
+          for i in $(seq 1 24); do
+            STATE=$(flyctl status --app suts-fyp-floodwatch-mqtt --json \
+              | jq -r '.Machines[0].state // "unknown"')
+            echo "Attempt $i/24: machine state = $STATE"
+            if [ "$STATE" = "started" ]; then
+              echo "Machine started. Waiting 60s to confirm it stays up..."
+              sleep 60
+              STATE=$(flyctl status --app suts-fyp-floodwatch-mqtt --json \
+                | jq -r '.Machines[0].state // "unknown"')
+              if [ "$STATE" = "started" ]; then
+                echo "Machine is stable and still running."
+                exit 0
+              else
+                echo "Machine stopped after 60s (state: $STATE)."
+                echo "This is likely the Fly.io trial 5-minute limit."
+                echo "Add a credit card at https://fly.io/trial to fix this."
+                exit 1
+              fi
+            fi
+            sleep 5
+          done
+          echo "Machine did not reach 'started' state within 2 minutes."
+          exit 1
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
       - name: Print result
         run: |
           echo "Broker is live at: suts-fyp-floodwatch-mqtt.fly.dev:1883"
