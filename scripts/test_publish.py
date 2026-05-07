@@ -97,7 +97,7 @@ try:
         info.wait_for_publish()
         print(f"→ {msg}")
 
-        time.sleep(random.uniform(2, 6))
+        time.sleep(random.uniform(2, 3))
 
 except KeyboardInterrupt:
     print("\nStopped.")
