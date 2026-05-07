@@ -83,11 +83,13 @@ app.add_middleware(
 #   2. Fan out to all connected SSE client queues
 
 _sse_clients: set[asyncio.Queue] = set()
+_subscriber_task: asyncio.Task | None = None
 
 
 @app.on_event("startup")
 async def start_redis_subscriber():
-    asyncio.create_task(_redis_subscriber())
+    global _subscriber_task
+    _subscriber_task = asyncio.create_task(_redis_subscriber())
 
 
 async def _redis_subscriber():
