@@ -1,0 +1,4 @@
+paho-mqtt==2.1.0
+pymongo==4.7.2
+python-dotenv==1.0.0
+redis==5.0.8

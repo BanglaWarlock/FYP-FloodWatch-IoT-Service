@@ -7,3 +7,12 @@ mosquitto/certs/
 .env
 .env.*
 !.env.example
+
+# Claude Code tooling
+.claude/
+
+# Architecture drafts and scratch files
+architecture.html
+architecturev2.html
+data/
+scripts/generate-charts.py

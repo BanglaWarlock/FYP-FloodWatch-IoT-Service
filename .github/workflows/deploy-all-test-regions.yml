@@ -1,0 +1,108 @@
+# ============================================================
+#  deploy-all-test-regions.yml
+#
+#  Deploys test MQTT brokers to all regions in parallel.
+#  Run this once before running the latency test script.
+#
+#  Actions → "Deploy all test region brokers" → Run workflow
+#
+#  Singapore is excluded — it uses the main broker.
+#  Each region gets: app + volume + dedicated IPv4 + autostop=off
+# ============================================================
+
+name: Deploy all test region brokers
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy ${{ matrix.region }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # keep deploying other regions if one fails
+      matrix:
+        region:
+          - nrt   # Tokyo, Japan
+          - syd   # Sydney, Australia
+          - bom   # Mumbai, India
+          - lhr   # London, UK
+          - fra   # Frankfurt, Germany
+          - arn   # Stockholm, Sweden
+          - cdg   # Paris, France
+          - iad   # Ashburn, VA (US)
+          - ewr   # Secaucus, NJ (US)
+          - dfw   # Dallas, TX (US)
+          - lax   # Los Angeles, CA (US)
+          - sjc   # San Jose, CA (US)
+          - ord   # Chicago, IL (US)
+          - yyz   # Toronto, Canada
+          - gru   # São Paulo, Brazil
+          - jnb   # Johannesburg, South Africa
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Create app (skips if exists)
+        run: |
+          APP="flood-mqtt-test-${{ matrix.region }}"
+          flyctl apps list | grep -q "$APP" \
+            && echo "App $APP already exists, skipping" \
+            || flyctl apps create "$APP"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Create volume (skips if exists)
+        run: |
+          APP="flood-mqtt-test-${{ matrix.region }}"
+          flyctl volumes list --app "$APP" | grep -q "mosquitto_data" \
+            && echo "Volume already exists, skipping" \
+            || flyctl volumes create mosquitto_data \
+                --region ${{ matrix.region }} \
+                --size 1 \
+                --app "$APP" \
+                --yes
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Deploy broker
+        run: |
+          flyctl deploy \
+            --app "flood-mqtt-test-${{ matrix.region }}" \
+            --config fly.toml \
+            --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Ensure dedicated IPv4
+        run: |
+          APP="flood-mqtt-test-${{ matrix.region }}"
+          IPS=$(flyctl ips list --app "$APP" --json)
+          DEDICATED=$(echo "$IPS" | jq -r '.[] | select(.type=="public" and .version=="v4") | .address' | head -1)
+          if [ -n "$DEDICATED" ]; then
+            echo "Dedicated IPv4 already exists: $DEDICATED"
+          else
+            SHARED=$(echo "$IPS" | jq -r '.[] | select(.type=="shared_v4") | .address' | head -1)
+            if [ -n "$SHARED" ]; then
+              flyctl ips release "$SHARED" --app "$APP"
+            fi
+            flyctl ips allocate-v4 --app "$APP" --yes
+          fi
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Disable auto-stop
+        run: |
+          APP="flood-mqtt-test-${{ matrix.region }}"
+          MACHINE_IDS=$(flyctl machine list --app "$APP" --json | jq -r '.[].id')
+          for ID in $MACHINE_IDS; do
+            flyctl machine update "$ID" --app "$APP" --autostop=off --yes
+          done
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Print result
+        run: |
+          echo "flood-mqtt-test-${{ matrix.region }}.fly.dev:1883 is ready"

@@ -1,0 +1,60 @@
+services:
+
+  # Local Mosquitto broker — mirrors Fly.io config
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+    restart: unless-stopped
+
+  # Local MongoDB — mirrors Atlas schema
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: unless-stopped
+
+  # Redis — internal event bus between parser and API
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # MQTT listener — parses readings, writes to MongoDB, publishes SSE events to Redis
+  parser:
+    build: ./parser
+    env_file: .env
+    environment:
+      MQTT_BROKER: mosquitto
+      MQTT_PORT: "1883"
+      MONGO_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - mosquitto
+      - mongo
+      - redis
+    restart: unless-stopped
+
+  # REST + SSE API — reads MongoDB, streams Redis events to SSE clients
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - mongo
+      - redis
+    restart: unless-stopped
+
+volumes:
+  mosquitto_data:
+  mongo_data:

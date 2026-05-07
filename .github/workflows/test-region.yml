@@ -11,7 +11,7 @@
 #    5. Compare results — pick the winning region
 #
 #  To clean up a test region (stop billing):
-#    fly apps destroy flood-mqtt-test-hkg --yes
+#    Actions → "Destroy test region broker" → pick region
 # ============================================================
 
 name: Deploy broker to test region
@@ -22,14 +22,14 @@ on:
       region:
         description: 'Fly.io region to test'
         required: true
-        default: 'sin'
+        default: 'hkg'
         type: choice
         options:
-          - sin   # Singapore
           - hkg   # Hong Kong
           - bom   # Mumbai
           - nrt   # Tokyo
           - syd   # Sydney
+          - sin   # Singapore
           - lax   # Los Angeles (long baseline)
 
 jobs:
@@ -70,8 +70,42 @@ jobs:
         run: |
           flyctl deploy \
             --app "${{ steps.names.outputs.app }}" \
-            --config fly.${{ inputs.region }}.toml \
-            --remote-only
+            --config fly.toml \
+            --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Ensure dedicated IPv4
+        run: |
+          IPS=$(flyctl ips list --app "${{ steps.names.outputs.app }}" --json)
+          DEDICATED=$(echo "$IPS" | jq -r '.[] | select(.type=="public" and .version=="v4") | .address' | head -1)
+          if [ -n "$DEDICATED" ]; then
+            echo "Dedicated IPv4 already exists: $DEDICATED, skipping"
+          else
+            SHARED=$(echo "$IPS" | jq -r '.[] | select(.type=="shared_v4") | .address' | head -1)
+            if [ -n "$SHARED" ]; then
+              echo "Releasing shared IPv4: $SHARED"
+              flyctl ips release "$SHARED" --app "${{ steps.names.outputs.app }}"
+            fi
+            echo "Allocating dedicated IPv4..."
+            flyctl ips allocate-v4 --app "${{ steps.names.outputs.app }}" --yes
+          fi
+          echo "Current IPs:"
+          flyctl ips list --app "${{ steps.names.outputs.app }}"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Disable auto-stop
+        run: |
+          MACHINE_IDS=$(flyctl machine list --app "${{ steps.names.outputs.app }}" --json \
+            | jq -r '.[].id')
+          for ID in $MACHINE_IDS; do
+            echo "Setting autostop=off on machine $ID"
+            flyctl machine update "$ID" \
+              --app "${{ steps.names.outputs.app }}" \
+              --autostop=off \
+              --yes
+          done
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -89,12 +123,15 @@ jobs:
           echo "    pip install paho-mqtt"
           echo "    python scripts/test-region-latency.py"
           echo ""
-          echo "  To test a single broker:"
+          echo "  Run stress test:"
+          echo "    python scripts/test-region-latency.py --stress"
+          echo ""
+          echo "  Test a single broker:"
           echo "    python scripts/test-region-latency.py \\"
           echo "      --broker ${{ steps.names.outputs.app }}.fly.dev"
           echo ""
-          echo "  To clean up after testing:"
-          echo "    fly apps destroy ${{ steps.names.outputs.app }} --yes"
+          echo "  Auto-cleanup after test:"
+          echo "    python scripts/test-region-latency.py --cleanup"
+          echo ""
+          echo "  Or manually: Actions → Destroy test region broker → ${{ inputs.region }}"
           echo "======================================================"
-
-          fly apps destroy flood-mqtt-test-hkg --yes

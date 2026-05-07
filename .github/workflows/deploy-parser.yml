@@ -1,0 +1,63 @@
+name: Deploy parser to AWS EC2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "parser/**"
+      - ".github/workflows/deploy-parser.yml"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push parser image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./parser
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/floodwatch-parser:latest
+
+      - name: Deploy to AWS EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.AWS_EC2_HOST }}
+          username: ${{ secrets.AWS_EC2_USER }}
+          key:      ${{ secrets.AWS_EC2_SSH_KEY }}
+          script: |
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Pull latest parser image
+            docker pull ghcr.io/${{ github.repository_owner }}/floodwatch-parser:latest
+
+            # Write env file (secrets injected by Actions)
+            cat > /opt/floodwatch/parser.env << 'EOF'
+            MQTT_BROKER=${{ secrets.MQTT_BROKER }}
+            MQTT_PORT=1883
+            MONGO_URI=${{ secrets.MONGO_URI }}
+            MONGO_DB=${{ secrets.MONGO_DB }}
+            NODES_WITHOUT_FLOAT=${{ secrets.NODES_WITHOUT_FLOAT }}
+            REDIS_URL=${{ secrets.REDIS_URL }}
+            BATTERY_LOW_V=11.5
+            EOF
+
+            # Restart container
+            docker stop floodwatch-parser 2>/dev/null || true
+            docker rm   floodwatch-parser 2>/dev/null || true
+            docker run -d \
+              --name floodwatch-parser \
+              --restart unless-stopped \
+              --env-file /opt/floodwatch/parser.env \
+              ghcr.io/${{ github.repository_owner }}/floodwatch-parser:latest
+
+            echo "Parser deployed — $(docker inspect --format='{{.State.Status}}' floodwatch-parser)"

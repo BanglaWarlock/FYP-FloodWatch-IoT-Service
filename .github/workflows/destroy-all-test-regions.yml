@@ -1,0 +1,51 @@
+# ============================================================
+#  destroy-all-test-regions.yml
+#
+#  Destroys all test region brokers in parallel.
+#  Singapore (suts-fyp-floodwatch-mqtt) is never touched.
+#
+#  Actions → "Destroy all test region brokers" → Run workflow
+# ============================================================
+
+name: Destroy all test region brokers
+
+on:
+  workflow_dispatch:
+
+jobs:
+  destroy:
+    name: Destroy ${{ matrix.region }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        region:
+          - nrt   # Tokyo, Japan
+          - syd   # Sydney, Australia
+          - bom   # Mumbai, India
+          - lhr   # London, UK
+          - fra   # Frankfurt, Germany
+          - arn   # Stockholm, Sweden
+          - cdg   # Paris, France
+          - iad   # Ashburn, VA (US)
+          - ewr   # Secaucus, NJ (US)
+          - dfw   # Dallas, TX (US)
+          - lax   # Los Angeles, CA (US)
+          - sjc   # San Jose, CA (US)
+          - ord   # Chicago, IL (US)
+          - yyz   # Toronto, Canada
+          - gru   # São Paulo, Brazil
+          - jnb   # Johannesburg, South Africa
+
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Destroy app
+        run: |
+          APP="flood-mqtt-test-${{ matrix.region }}"
+          flyctl apps list | grep -q "$APP" \
+            && flyctl apps destroy "$APP" --yes \
+            && echo "Destroyed: $APP" \
+            || echo "$APP not found, skipping"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
