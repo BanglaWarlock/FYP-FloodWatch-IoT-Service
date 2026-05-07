@@ -91,35 +91,41 @@ async def start_redis_subscriber():
 
 
 async def _redis_subscriber():
-    redis  = aioredis.from_url(REDIS_URL, decode_responses=True)
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(REDIS_CHANNEL)
-    log.info(f"Redis subscriber ready — channel: {REDIS_CHANNEL}")
-
-    async for message in pubsub.listen():
-        if message["type"] != "message":
-            continue
-
-        raw = message["data"]
-
-        # 1. Persist to MongoDB (run in thread to avoid blocking the loop)
+    while True:
         try:
-            event = json.loads(raw)
-            doc   = {**event, "timestamp": datetime.now(timezone.utc)}
-            doc.pop("type", None)           # stored in "type" field separately
-            doc["type"] = event.get("type", "unknown")
-            await asyncio.to_thread(col_events.insert_one, doc)
-        except Exception as e:
-            log.warning(f"Event log write failed: {e}")
+            redis  = aioredis.from_url(REDIS_URL, decode_responses=True)
+            pubsub = redis.pubsub()
+            await pubsub.subscribe(REDIS_CHANNEL)
+            log.info(f"Redis subscriber ready — channel: {REDIS_CHANNEL}")
 
-        # 2. Fan out to all SSE clients
-        dead = set()
-        for q in _sse_clients:
-            try:
-                q.put_nowait(raw)
-            except asyncio.QueueFull:
-                dead.add(q)
-        _sse_clients.difference_update(dead)
+            async for message in pubsub.listen():
+                if message["type"] != "message":
+                    continue
+
+                raw = message["data"]
+
+                # 1. Persist to MongoDB
+                try:
+                    event = json.loads(raw)
+                    doc   = {**event, "timestamp": datetime.now(timezone.utc)}
+                    doc.pop("type", None)
+                    doc["type"] = event.get("type", "unknown")
+                    await asyncio.to_thread(col_events.insert_one, doc)
+                except Exception as e:
+                    log.warning(f"Event log write failed: {e}")
+
+                # 2. Fan out to all SSE clients
+                dead = set()
+                for q in _sse_clients:
+                    try:
+                        q.put_nowait(raw)
+                    except asyncio.QueueFull:
+                        dead.add(q)
+                _sse_clients.difference_update(dead)
+
+        except Exception as e:
+            log.error(f"Redis subscriber crashed: {e} — reconnecting in 5s")
+            await asyncio.sleep(5)
 
 
 # ── Helpers ───────────────────────────────────────────────────
