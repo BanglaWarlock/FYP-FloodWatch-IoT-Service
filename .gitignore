@@ -16,3 +16,6 @@ architecture.html
 architecturev2.html
 data/
 scripts/generate-charts.py
+
+# Local debugging notes
+debug_notes.md
