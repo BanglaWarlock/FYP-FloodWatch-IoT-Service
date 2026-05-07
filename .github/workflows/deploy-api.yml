@@ -85,6 +85,7 @@ jobs:
             cat > /opt/floodwatch/api.env << 'EOF'
             MONGO_URI=${{ secrets.MONGO_URI }}
             MONGO_DB=${{ secrets.MONGO_DB }}
+            MONGO_COL=${{ secrets.MONGO_COL }}
             REDIS_URL=redis://:${{ secrets.REDIS_PASSWORD }}@floodwatch-redis:6379
             EOF
 
