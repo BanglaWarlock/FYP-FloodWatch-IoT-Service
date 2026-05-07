@@ -46,7 +46,8 @@ jobs:
 
             docker pull ${{ env.IMAGE }}
 
-            cat > /opt/floodwatch/parser.env << 'EOF'
+            sudo mkdir -p /opt/floodwatch
+            cat << 'EOF' | sudo tee /opt/floodwatch/parser.env > /dev/null
             MQTT_BROKER=${{ secrets.MQTT_BROKER }}
             MQTT_PORT=1883
             MONGO_URI=${{ secrets.MONGO_URI }}
