@@ -63,13 +63,16 @@ WORKER_THREADS       = int(os.getenv("WORKER_THREADS", 4))             # paralle
 # round-robin — horizontal scaling with no duplicate processing.
 _S = f"$share/{MQTT_SHARE_GROUP}"
 TOPICS = [
-    (f"{_S}/floodwatch/+/master/status",  1),
-    (f"{_S}/floodwatch/+/heartbeat/+",    1),
-    (f"{_S}/floodwatch/+/alert/+",        1),
-    (f"{_S}/floodwatch/+/announce/+",     1),
-    (f"{_S}/floodwatch/+/nodes/+/status", 1),
-    (f"{_S}/floodwatch/+/topology",       0),
+    (f"{_S}/floodwatch/+/master/status",   1),
+    (f"{_S}/floodwatch/+/master/topology", 0),
+    (f"{_S}/floodwatch/+/heartbeat/+",     1),
+    (f"{_S}/floodwatch/+/alert/+",         1),
+    (f"{_S}/floodwatch/+/announce/+",      1),
+    (f"{_S}/floodwatch/+/nodes/+/status",  1),
+    (f"{_S}/floodwatch/+/topology",        0),
 ]
+
+SERVICE_STATUS_TOPIC = "floodwatch/system/listener/status"
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
 
@@ -157,7 +160,7 @@ def _update_village_gps(village_id: str):
     ))
     if not candidates:
         return
-    min_depth = min(n["depth"] for n in candidates)
+    min_depth = min(n.get("depth") or 99 for n in candidates)
     closest   = [n for n in candidates if n["depth"] == min_depth]
     avg_lat   = sum(n["lat"] for n in closest) / len(closest)
     avg_lng   = sum(n["lng"] for n in closest) / len(closest)
@@ -611,6 +614,62 @@ def handle_topology(village: str, payload: dict, now: datetime):
     log.info(f"topology  {village}  nodes={total}")
 
 
+def handle_full_topology(village: str, payload: dict, now: datetime):
+    """
+    floodwatch/{village}/master/topology  (flat array format)
+    Published by master periodically and on every topology change.
+    Bulk-upserts each node's parent/depth/online state into river_nodes.
+    """
+    nodes = payload.get("nodes", [])
+    if not isinstance(nodes, list) or not nodes:
+        return
+
+    for n in nodes:
+        node_id = n.get("node_id", "")
+        if not node_id:
+            continue
+        online  = bool(n.get("online", False))
+        parent  = n.get("parent", "")
+        depth   = n.get("depth", 0)
+        bat     = n.get("bat")
+        fb      = n.get("float_bits")
+        lat     = n.get("lat", 0.0)
+        lng     = n.get("lng", 0.0)
+        gps_fix = bool(n.get("gps_fix", False))
+        rssi    = n.get("rssi")
+        snr     = n.get("snr")
+
+        update: dict = {
+            "village_id": village,
+            "parent_id":  parent,
+            "depth":      depth,
+            "status":     "online" if online else "offline",
+            "last_seen":  now,
+        }
+        if bat is not None:
+            update["battery_voltage"] = round(float(bat), 2)
+        if fb is not None:
+            update["float_bits"] = fb
+        if gps_fix and (lat or lng):
+            update["lat"]     = lat
+            update["lng"]     = lng
+            update["gps_fix"] = True
+
+        col_rivers.update_one(
+            {"node_id": node_id},
+            {"$set": update, "$setOnInsert": {"first_seen": now}},
+            upsert=True
+        )
+
+    online_count = sum(1 for n in nodes if n.get("online", False))
+    col_villages.update_one(
+        {"village_id": village},
+        {"$set": {"last_seen": now, "nodes_online": online_count, "total_nodes": len(nodes)}},
+        upsert=True
+    )
+    log.info(f"full_topology  {village}  nodes={len(nodes)}  online={online_count}")
+
+
 # ── Health checker ────────────────────────────────────────────────────────────
 
 def _health_checker():
@@ -697,6 +756,9 @@ def _route(topic: str, raw: str):
         elif msg_type == "master" and len(parts) == 4 and parts[3] == "status":
             handle_master_status(village, payload, now)
 
+        elif msg_type == "master" and len(parts) == 4 and parts[3] == "topology":
+            handle_full_topology(village, payload, now)
+
         elif msg_type == "topology" and len(parts) == 3:
             handle_topology(village, payload, now)
 
@@ -719,6 +781,11 @@ def on_connect(client, userdata, flags, rc, props=None):
     if rc == 0:
         for topic, qos in TOPICS:
             client.subscribe(topic, qos=qos)
+        client.publish(
+            SERVICE_STATUS_TOPIC,
+            json.dumps({"status": "online", "service": "parser", "broker": MQTT_BROKER}),
+            qos=1, retain=True,
+        )
         log.info(f"MQTT connected — {MQTT_BROKER}:{MQTT_PORT}")
         log.info(f"Subscribed to {len(TOPICS)} topic patterns")
     else:
@@ -755,6 +822,12 @@ client = mqtt.Client(protocol=mqtt.MQTTv5)
 client.on_connect    = on_connect
 client.on_message    = on_message
 client.on_disconnect = on_disconnect
+
+client.will_set(
+    SERVICE_STATUS_TOPIC,
+    json.dumps({"status": "offline", "service": "parser"}),
+    qos=1, retain=True,
+)
 
 log.info(f"Connecting to {MQTT_BROKER}:{MQTT_PORT} ...")
 client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)

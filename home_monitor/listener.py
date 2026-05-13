@@ -32,7 +32,8 @@ MQTT_PORT   = int(os.getenv("MQTT_PORT", 1883))
 MONGO_URI   = os.getenv("MONGO_URI")
 MONGO_DB    = os.getenv("MONGO_DB", "flood_monitor")
 
-TOPIC = "floodwatch/home/+/battery"
+TOPIC                = "floodwatch/home/+/battery"
+SERVICE_STATUS_TOPIC = "floodwatch/system/home_monitor/status"
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
 
@@ -79,6 +80,11 @@ def handle_battery(device_id: str, payload: dict):
 def on_connect(client, userdata, flags, rc, props=None):
     if rc == 0:
         client.subscribe(TOPIC, qos=1)
+        client.publish(
+            SERVICE_STATUS_TOPIC,
+            json.dumps({"status": "online", "service": "home_monitor", "broker": MQTT_BROKER}),
+            qos=1, retain=True,
+        )
         log.info(f"Connected to {MQTT_BROKER}:{MQTT_PORT} — subscribed to {TOPIC}")
     else:
         log.error(f"Connect failed rc={rc}")
@@ -117,6 +123,12 @@ client = mqtt.Client(protocol=mqtt.MQTTv5)
 client.on_connect    = on_connect
 client.on_message    = on_message
 client.on_disconnect = on_disconnect
+
+client.will_set(
+    SERVICE_STATUS_TOPIC,
+    json.dumps({"status": "offline", "service": "home_monitor"}),
+    qos=1, retain=True,
+)
 
 log.info(f"Connecting to {MQTT_BROKER}:{MQTT_PORT} ...")
 client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
