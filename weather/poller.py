@@ -144,9 +144,8 @@ col_weather  = db["weather_history"]
 
 
 def _setup_indexes():
-    # TTL 90 days
-    col_weather.create_index("timestamp", expireAfterSeconds=90 * 24 * 3600)
     col_weather.create_index([("village_id", ASCENDING), ("timestamp", DESCENDING)])
+    col_weather.create_index("timestamp")
     log.info("Indexes verified")
 
 
