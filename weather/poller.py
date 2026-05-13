@@ -17,6 +17,7 @@ The parser reads villages.weather when writing alerts to embed weather_at_alert.
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -317,10 +318,14 @@ def _poll_all():
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
+RUN_ONCE = "--once" in sys.argv   # python poller.py --once  → poll all villages and exit
+
 log.info(f"MongoDB: {MONGO_DB}")
 _setup_indexes()
 log.info(f"Redis: {REDIS_URL}")
 log.info(f"Poll interval: {POLL_INTERVAL}s  Forecast: {FORECAST_HOURS}h  Spacing: {CALL_SPACING}s")
+if RUN_ONCE:
+    log.info("--once flag set: will poll all villages once then exit")
 
 while True:
     cycle_start = time.time()
@@ -328,6 +333,10 @@ while True:
         _poll_all()
     except Exception as e:
         log.error(f"Poll cycle error: {e}", exc_info=True)
+
+    if RUN_ONCE:
+        log.info("--once complete — exiting")
+        break
 
     elapsed = time.time() - cycle_start
     wait    = max(0, POLL_INTERVAL - elapsed)
