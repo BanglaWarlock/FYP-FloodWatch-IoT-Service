@@ -3,40 +3,49 @@
 FloodWatch API v2  —  FastAPI + SSE
 
 REST endpoints:
-  GET  /                                  health check
-  GET  /api/v1/stats                      global aggregate counters
-  GET  /api/v1/villages                   all villages (summary)
-  GET  /api/v1/villages/{village_id}      single village with topology
-  GET  /api/v1/nodes                      all river nodes (?village_id, ?status)
-  GET  /api/v1/nodes/{node_id}            single river node live state
-  GET  /api/v1/nodes/{node_id}/readings   paginated heartbeat history
-  GET  /api/v1/alerts                     paginated alerts (?village_id, ?node_id, ?alert_type)
-  GET  /api/v1/events/history             paginated event log (?event_type, ?node_id, ?village_id)
-  GET  /api/v1/events/stream              SSE live stream (?types=heartbeat,flood_level,...)
+  GET  /                                    health check
+  GET  /api/v1/stats                        global aggregate counters
+  GET  /api/v1/villages                     all villages (summary, no topology)
+  GET  /api/v1/villages/{village_id}        single village with full topology + weather
+  GET  /api/v1/nodes                        all river nodes (?village_id, ?status)
+  GET  /api/v1/nodes/{node_id}              single river node live state
+  GET  /api/v1/nodes/{node_id}/readings     paginated heartbeat history
+  GET  /api/v1/masters                      all master nodes
+  GET  /api/v1/alerts                       paginated alerts (?village_id, ?node_id, ?alert_type)
+  GET  /api/v1/weather/{village_id}         paginated weather history (change-only records)
+  GET  /api/v1/events/history               paginated event log (?event_type, ?node_id, ?village_id)
+  GET  /api/v1/events/stream                SSE live stream (?types=heartbeat,flood_level,...)
 
 SSE event types:
   heartbeat      — every sensor reading
-  flood_level    — water level changed
-  alert          — any alert (flood, battery, gps_*)
+  flood_level    — water level changed (water_level, water_level_prev)
+  alert          — any alert (flood, battery, gps_signal_lost, gps_restored, gps_moved)
   node_online    — node came online
   node_offline   — node went offline
   master_online  — master connected
   master_offline — master disconnected (LWT)
   node_announce  — node GPS calibration complete
   weather_update — village weather changed (from weather poller)
+
+Alert fields for gps_moved:
+  dist_m      — metres from install position
+  lat/lng     — current position
+  home_lat/home_lng — original install position
 """
 
 import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import datetime
 
 import redis.asyncio as aioredis
+from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pymongo import MongoClient, DESCENDING, ASCENDING
+from pymongo import MongoClient, DESCENDING
 from sse_starlette.sse import EventSourceResponse
 from starlette.requests import Request
 
@@ -54,41 +63,21 @@ REDIS_CHANNEL = "floodwatch:events"
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
 
-mongo        = MongoClient(MONGO_URI)
-db           = mongo[MONGO_DB]
-col_global   = db["global_stats"]
-col_villages = db["villages"]
-col_masters  = db["master_nodes"]
-col_rivers   = db["river_nodes"]
+mongo          = MongoClient(MONGO_URI)
+db             = mongo[MONGO_DB]
+col_global     = db["global_stats"]
+col_villages   = db["villages"]
+col_masters    = db["master_nodes"]
+col_rivers     = db["river_nodes"]
 col_heartbeats = db["heartbeats"]
-col_alerts   = db["alerts"]
-col_events   = db["events"]
-
-# ── App ───────────────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="FloodWatch IoT API",
-    version="2.0.0",
-    description="REST + SSE API for FloodWatch flood sensor network.",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
+col_alerts     = db["alerts"]
+col_events     = db["events"]
+col_weather    = db["weather_history"]
 
 # ── SSE fan-out ───────────────────────────────────────────────────────────────
 
 _sse_clients: set[asyncio.Queue] = set()
 _subscriber_task: asyncio.Task | None = None
-
-
-@app.on_event("startup")
-async def start_redis_subscriber():
-    global _subscriber_task
-    _subscriber_task = asyncio.create_task(_redis_subscriber())
 
 
 async def _redis_subscriber():
@@ -116,15 +105,44 @@ async def _redis_subscriber():
             await asyncio.sleep(5)
 
 
-# ── Serialisers ───────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _subscriber_task
+    _subscriber_task = asyncio.create_task(_redis_subscriber())
+    yield
+    if _subscriber_task:
+        _subscriber_task.cancel()
 
-def _clean(doc: dict) -> dict:
-    """Remove _id and convert datetimes to ISO strings."""
-    out = {k: v for k, v in doc.items() if k != "_id"}
-    for k, v in out.items():
-        if isinstance(v, datetime):
-            out[k] = v.isoformat()
-    return out
+
+# ── App ───────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="FloodWatch IoT API",
+    version="2.0.0",
+    description="REST + SSE API for FloodWatch flood sensor network.",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# ── Serialiser ────────────────────────────────────────────────────────────────
+
+def _clean(value):
+    """Recursively strip _id, convert datetimes to ISO strings, ObjectIds to str."""
+    if isinstance(value, dict):
+        return {k: _clean(v) for k, v in value.items() if k != "_id"}
+    if isinstance(value, list):
+        return [_clean(v) for v in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, ObjectId):
+        return str(value)
+    return value
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -141,33 +159,44 @@ def get_stats():
     """
     Single-document aggregate counters — total nodes, villages, alerts by type, etc.
     Always O(1) — the parser keeps this updated atomically.
+    Live online/offline counts are augmented from river_nodes for accuracy.
     """
     doc = col_global.find_one({"_id": "global"}) or {}
     doc.pop("_id", None)
-    if isinstance(doc.get("last_updated"), datetime):
-        doc["last_updated"] = doc["last_updated"].isoformat()
-    # Augment with live online counts from river_nodes (accurate)
     doc["nodes_online"]  = col_rivers.count_documents({"status": "online"})
     doc["nodes_offline"] = col_rivers.count_documents({"status": "offline"})
-    return doc
+    return _clean(doc)
 
 
 # ── Villages ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/villages", tags=["villages"])
 def list_villages():
-    """All villages with summary. Topology excluded from list view."""
-    docs = col_villages.find({}, {"topology": 0, "gps_source_nodes": 0})
+    """All villages with summary fields. Topology and weather forecast excluded."""
+    docs = col_villages.find({}, {"topology": 0, "weather_forecast": 0})
     return [_clean(d) for d in docs]
 
 
 @app.get("/api/v1/villages/{village_id}", tags=["villages"])
 def get_village(village_id: str):
-    """Single village with full topology and node list."""
+    """Single village with full topology, current weather, and 24h forecast."""
     doc = col_villages.find_one({"village_id": village_id})
     if not doc:
         raise HTTPException(404, f"Village '{village_id}' not found")
     return _clean(doc)
+
+
+# ── Master nodes ──────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/masters", tags=["masters"])
+def list_masters(
+    village_id: str = Query(default=None, description="Filter by village"),
+):
+    """All master nodes with current status."""
+    query: dict = {}
+    if village_id:
+        query["village_id"] = village_id
+    return [_clean(d) for d in col_masters.find(query)]
 
 
 # ── River nodes ───────────────────────────────────────────────────────────────
@@ -177,10 +206,7 @@ def list_nodes(
     village_id: str = Query(default=None, description="Filter by village"),
     status:     str = Query(default=None, description="online | offline"),
 ):
-    """
-    All river nodes with current live state.
-    Reads directly from river_nodes collection — O(n nodes), no aggregation.
-    """
+    """All river nodes with current live state."""
     query: dict = {}
     if village_id:
         query["village_id"] = village_id
@@ -200,12 +226,12 @@ def get_node(node_id: str):
 
 @app.get("/api/v1/nodes/{node_id}/readings", tags=["nodes"])
 def node_readings(
-    node_id:    str,
-    page:       int = Query(default=1,  ge=1),
-    page_size:  int = Query(default=50, ge=1, le=200),
-    gps_only:   bool = Query(default=False, description="Only return readings with a GPS fix"),
+    node_id:   str,
+    page:      int  = Query(default=1,  ge=1),
+    page_size: int  = Query(default=50, ge=1, le=200),
+    gps_only:  bool = Query(default=False, description="Only return readings with a GPS fix"),
 ):
-    """Paginated sensor reading history for a node (newest first)."""
+    """Paginated heartbeat history for a node (newest first)."""
     query: dict = {"node_id": node_id}
     if gps_only:
         query["gps_fix"] = True
@@ -213,7 +239,8 @@ def node_readings(
     cursor = col_heartbeats.find(query).sort("timestamp", DESCENDING).skip(skip).limit(page_size)
     data   = [_clean(d) for d in cursor]
     if not data and page == 1:
-        raise HTTPException(404, f"Node '{node_id}' not found")
+        if not col_rivers.find_one({"node_id": node_id}, {"_id": 1}):
+            raise HTTPException(404, f"Node '{node_id}' not found")
     return {"node_id": node_id, "page": page, "page_size": page_size, "data": data}
 
 
@@ -227,7 +254,10 @@ def list_alerts(
     page:       int = Query(default=1,  ge=1),
     page_size:  int = Query(default=50, ge=1, le=200),
 ):
-    """Paginated alert history across all nodes or filtered. Newest first."""
+    """
+    Paginated alert history. Newest first.
+    gps_moved alerts include dist_m, lat/lng (current), home_lat/home_lng (install position).
+    """
     query: dict = {}
     if village_id:  query["village_id"]  = village_id
     if node_id:     query["node_id"]     = node_id
@@ -235,6 +265,28 @@ def list_alerts(
     skip   = (page - 1) * page_size
     cursor = col_alerts.find(query).sort("timestamp", DESCENDING).skip(skip).limit(page_size)
     return {"page": page, "page_size": page_size, "data": [_clean(d) for d in cursor]}
+
+
+# ── Weather history ───────────────────────────────────────────────────────────
+
+@app.get("/api/v1/weather/{village_id}", tags=["weather"])
+def get_weather_history(
+    village_id: str,
+    page:       int = Query(default=1,  ge=1),
+    page_size:  int = Query(default=48, ge=1, le=200),
+):
+    """
+    Paginated weather history for a village (newest first).
+    Only records where at least one field changed from the previous poll are stored.
+    The last record represents current conditions until the next change.
+    Use villages/{village_id} for the latest snapshot + 24h forecast.
+    """
+    skip   = (page - 1) * page_size
+    cursor = col_weather.find({"village_id": village_id}).sort("timestamp", DESCENDING).skip(skip).limit(page_size)
+    data   = [_clean(d) for d in cursor]
+    if not data and page == 1:
+        raise HTTPException(404, f"No weather history for village '{village_id}'")
+    return {"village_id": village_id, "page": page, "page_size": page_size, "data": data}
 
 
 # ── Event log ─────────────────────────────────────────────────────────────────
@@ -264,7 +316,7 @@ async def sse_stream(
     request: Request,
     types: str = Query(
         default="heartbeat,flood_level,alert,node_online,node_offline,weather_update",
-        description="Comma-separated event types. Omit for all.",
+        description="Comma-separated event types, or 'all'.",
     ),
 ):
     """
