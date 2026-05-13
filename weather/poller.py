@@ -252,7 +252,8 @@ def _poll_all():
         current, forecast = result
         now = current["fetched_at"]
 
-        # Update village: latest snapshot + forecast (overwrite each poll)
+        # Always update village.weather so the dashboard has the freshest numbers.
+        # weather_forecast is also always overwritten with the latest lookahead.
         col_villages.update_one(
             {"village_id": vid},
             {"$set": {
@@ -261,30 +262,42 @@ def _poll_all():
             }}
         )
 
-        # Historical record: current conditions only (forecast is transient)
-        col_weather.insert_one({
-            "village_id": vid,
-            "timestamp":  now,
-            "lat":        lat,
-            "lng":        lng,
-            # Spread current fields at top level for easy range queries
-            # e.g. find all readings where rain_mm > 5
-            **{k: v for k, v in current.items() if k != "fetched_at"},
-        })
-
-        _publish("weather_update", {
-            "village_id": vid,
-            "timestamp":  now.isoformat(),
-            **{k: v for k, v in current.items() if k != "fetched_at"},
-        })
-
-        log.info(
-            f"  {vid}  {current.get('temperature_c')}°C  "
-            f"rain={current.get('rain_mm')}mm  "
-            f"humidity={current.get('humidity_pct')}%  "
-            f"code={current.get('weather_code')}  "
-            f"is_day={current.get('is_day')}"
+        # Only write to weather_history when the WMO weather_code changes.
+        # Unchanged polls are implied: "last recorded state is still in effect."
+        # This avoids storing 48 identical docs per day during stable weather.
+        last      = col_weather.find_one(
+            {"village_id": vid},
+            {"weather_code": 1},
+            sort=[("timestamp", DESCENDING)],
         )
+        new_code  = current.get("weather_code")
+        prev_code = last.get("weather_code") if last else None
+
+        if prev_code != new_code:
+            col_weather.insert_one({
+                "village_id": vid,
+                "timestamp":  now,
+                "lat":        lat,
+                "lng":        lng,
+                **{k: v for k, v in current.items() if k != "fetched_at"},
+            })
+
+            _publish("weather_update", {
+                "village_id":        vid,
+                "timestamp":         now.isoformat(),
+                "prev_weather_code": prev_code,
+                **{k: v for k, v in current.items() if k != "fetched_at"},
+            })
+
+            log.info(
+                f"  {vid}  CHANGED  code={prev_code}→{new_code}  "
+                f"{current.get('temperature_c')}°C  rain={current.get('rain_mm')}mm"
+            )
+        else:
+            log.info(
+                f"  {vid}  unchanged (code={new_code}  "
+                f"{current.get('temperature_c')}°C  rain={current.get('rain_mm')}mm)"
+            )
 
         time.sleep(CALL_SPACING)
 
