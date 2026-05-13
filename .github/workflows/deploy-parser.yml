@@ -52,9 +52,9 @@ jobs:
             MQTT_PORT=1883
             MONGO_URI=${{ secrets.MONGO_URI }}
             MONGO_DB=${{ secrets.MONGO_DB }}
-            NODES_WITHOUT_FLOAT=${{ secrets.NODES_WITHOUT_FLOAT }}
             REDIS_URL=${{ secrets.REDIS_URL }}
-            BATTERY_LOW_V=11.5
+            NODE_OFFLINE_TIMEOUT=60
+            ALERT_DEDUP_WINDOW=60
             EOF
 
             docker stop floodwatch-parser 2>/dev/null || true

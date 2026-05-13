@@ -14,8 +14,20 @@ mosquitto/certs/
 # Architecture drafts and scratch files
 architecture.html
 architecturev2.html
+architecture/
 data/
 scripts/generate-charts.py
 
 # Local debugging notes
 debug_notes.md
+
+# Paper drafts and planning notes
+paper_draft.txt
+monitoring_plan.txt
+separation_justification.txt
+
+# Schema and backend planning docs (local only)
+DB_SCHEMA_PLAN.md
+
+# Firmware/packet reference (local context file)
+PACKET_REFERENCE.md
