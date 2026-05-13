@@ -159,6 +159,23 @@ def _publish(event_type: str, data: dict):
     _redis.publish(REDIS_CHANNEL, json.dumps(data, default=str))
 
 
+# ── Change detection ─────────────────────────────────────────────────────────
+
+def _weather_changed(current: dict, last_doc: dict | None) -> bool:
+    """
+    Return True if any weather field differs from the last stored snapshot.
+    Categorical fields (weather_code, is_day) rarely change; continuous fields
+    (temperature, pressure, rain) change most polls — both are treated the same.
+    Any field that happens to be identical is a free skip.
+    """
+    if last_doc is None:
+        return True
+    return any(
+        current.get(key) != last_doc.get(key)
+        for key in _CURRENT_MAP.values()
+    )
+
+
 # ── Open-Meteo fetch ──────────────────────────────────────────────────────────
 
 def _parse_current(raw: dict, now: datetime) -> dict:
@@ -262,18 +279,15 @@ def _poll_all():
             }}
         )
 
-        # Only write to weather_history when the WMO weather_code changes.
-        # Unchanged polls are implied: "last recorded state is still in effect."
-        # This avoids storing 48 identical docs per day during stable weather.
-        last      = col_weather.find_one(
+        # Write to weather_history only when at least one field changed.
+        # The last stored doc is the implied state from its timestamp onward.
+        # Fetch all weather fields so _weather_changed can compare each one.
+        last = col_weather.find_one(
             {"village_id": vid},
-            {"weather_code": 1},
             sort=[("timestamp", DESCENDING)],
         )
-        new_code  = current.get("weather_code")
-        prev_code = last.get("weather_code") if last else None
 
-        if prev_code != new_code:
+        if _weather_changed(current, last):
             col_weather.insert_one({
                 "village_id": vid,
                 "timestamp":  now,
@@ -283,19 +297,18 @@ def _poll_all():
             })
 
             _publish("weather_update", {
-                "village_id":        vid,
-                "timestamp":         now.isoformat(),
-                "prev_weather_code": prev_code,
+                "village_id": vid,
+                "timestamp":  now.isoformat(),
                 **{k: v for k, v in current.items() if k != "fetched_at"},
             })
 
             log.info(
-                f"  {vid}  CHANGED  code={prev_code}→{new_code}  "
+                f"  {vid}  CHANGED  code={current.get('weather_code')}  "
                 f"{current.get('temperature_c')}°C  rain={current.get('rain_mm')}mm"
             )
         else:
             log.info(
-                f"  {vid}  unchanged (code={new_code}  "
+                f"  {vid}  unchanged (code={current.get('weather_code')}  "
                 f"{current.get('temperature_c')}°C  rain={current.get('rain_mm')}mm)"
             )
 
