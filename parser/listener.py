@@ -24,10 +24,10 @@ Collections written:
 import json
 import logging
 import os
-import queue
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
 import paho.mqtt.client as mqtt
@@ -344,6 +344,10 @@ def handle_alert(village: str, node_id: str, payload: dict, now: datetime):
 
     ts = now.isoformat()
 
+    # Snapshot village weather at alert time for historical correlation
+    village_doc    = col_villages.find_one({"village_id": village}, {"weather": 1})
+    weather_snapshot = village_doc.get("weather") if village_doc else None
+
     # Insert alert record; store its ObjectId on river_nodes as last_alert_id
     alert_result = col_alerts.insert_one({
         "node_id":         node_id,
@@ -359,6 +363,7 @@ def handle_alert(village: str, node_id: str, payload: dict, now: datetime):
         "gps_fix":         gps_fix,
         "rssi":            rssi,
         "snr":             snr,
+        "weather_at_alert": weather_snapshot,
     })
 
     col_rivers.update_one(
@@ -642,9 +647,6 @@ def _health_checker():
 
 # ── Worker / router ───────────────────────────────────────────────────────────
 
-_msg_queue: queue.Queue = queue.Queue(maxsize=1024)
-
-
 def _route(topic: str, raw: str):
     """Parse topic, decode JSON, dispatch to handler."""
     try:
@@ -702,20 +704,6 @@ def _route(topic: str, raw: str):
         })
 
 
-def _worker():
-    while True:
-        item = _msg_queue.get()
-        if item is None:
-            break
-        topic, raw = item
-        try:
-            _route(topic, raw)
-        except Exception as e:
-            log.error(f"Worker error: {e}", exc_info=True)
-        finally:
-            _msg_queue.task_done()
-
-
 # ── MQTT callbacks ────────────────────────────────────────────────────────────
 
 def on_connect(client, userdata, flags, rc, props=None):
@@ -732,10 +720,7 @@ def on_message(client, userdata, msg):
     raw = msg.payload.decode("utf-8", errors="replace").strip()
     if not raw:
         return
-    try:
-        _msg_queue.put_nowait((msg.topic, raw))
-    except queue.Full:
-        log.error("Message queue full — dropping message")
+    _executor.submit(_route, msg.topic, raw)
 
 
 def on_disconnect(client, userdata, rc, props=None):
@@ -755,8 +740,7 @@ log.info(f"Alert dedup window: {ALERT_DEDUP_WINDOW}s")
 log.info(f"Worker threads: {WORKER_THREADS}")
 
 threading.Thread(target=_health_checker, name="health-checker", daemon=True).start()
-for _i in range(WORKER_THREADS):
-    threading.Thread(target=_worker, name=f"msg-worker-{_i}", daemon=True).start()
+_executor = ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="msg-worker")
 
 client = mqtt.Client(protocol=mqtt.MQTTv5)
 client.on_connect    = on_connect
