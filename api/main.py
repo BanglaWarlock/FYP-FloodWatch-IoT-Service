@@ -23,6 +23,7 @@ SSE event types:
   master_online  — master connected
   master_offline — master disconnected (LWT)
   node_announce  — node GPS calibration complete
+  weather_update — village weather changed (from weather poller)
 """
 
 import asyncio
@@ -262,7 +263,7 @@ def event_history(
 async def sse_stream(
     request: Request,
     types: str = Query(
-        default="heartbeat,flood_level,alert,node_online,node_offline",
+        default="heartbeat,flood_level,alert,node_online,node_offline,weather_update",
         description="Comma-separated event types. Omit for all.",
     ),
 ):
@@ -277,7 +278,7 @@ async def sse_stream(
 
     Available types:
       heartbeat, flood_level, alert, node_online, node_offline,
-      master_online, master_offline, node_announce
+      master_online, master_offline, node_announce, weather_update
     """
     wanted = {t.strip() for t in types.split(",")} if types != "all" else None
     q: asyncio.Queue = asyncio.Queue(maxsize=256)
