@@ -27,6 +27,7 @@ import os
 import queue
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 
 import paho.mqtt.client as mqtt
@@ -51,16 +52,22 @@ MONGO_URI            = os.getenv("MONGO_URI")
 MONGO_DB             = os.getenv("MONGO_DB", "flood_monitor")
 REDIS_URL            = os.getenv("REDIS_URL", "redis://localhost:6379")
 REDIS_CHANNEL        = "floodwatch:events"
-NODE_OFFLINE_TIMEOUT = int(os.getenv("NODE_OFFLINE_TIMEOUT", 60))   # seconds
-ALERT_DEDUP_WINDOW   = int(os.getenv("ALERT_DEDUP_WINDOW", 60))     # seconds
+NODE_OFFLINE_TIMEOUT   = int(os.getenv("NODE_OFFLINE_TIMEOUT",   60))    # seconds
+ALERT_DEDUP_WINDOW     = int(os.getenv("ALERT_DEDUP_WINDOW",     60))    # seconds
+ALERT_DEDUP_MAX        = int(os.getenv("ALERT_DEDUP_MAX",        50000)) # max entries in dedup cache
+MQTT_SHARE_GROUP       = os.getenv("MQTT_SHARE_GROUP", "parsers")        # shared subscription group
 
+# Shared subscriptions: $share/{group}/{filter}
+# Multiple parser instances with the same group receive each message exactly once,
+# round-robin — horizontal scaling with no duplicate processing.
+_S = f"$share/{MQTT_SHARE_GROUP}"
 TOPICS = [
-    ("floodwatch/+/master/status",  1),
-    ("floodwatch/+/sensor/+",       1),
-    ("floodwatch/+/alert/+",        1),
-    ("floodwatch/+/announce/+",     1),
-    ("floodwatch/+/nodes/+/status", 1),
-    ("floodwatch/+/topology",       0),
+    (f"{_S}/floodwatch/+/master/status",  1),
+    (f"{_S}/floodwatch/+/sensor/+",       1),
+    (f"{_S}/floodwatch/+/alert/+",        1),
+    (f"{_S}/floodwatch/+/announce/+",     1),
+    (f"{_S}/floodwatch/+/nodes/+/status", 1),
+    (f"{_S}/floodwatch/+/topology",       0),
 ]
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
@@ -119,7 +126,10 @@ def publish_redis(event_type: str, data: dict):
 _last_water_level: dict[str, int] = {}
 
 # alert dedup: (node_id, alert_type) → last published datetime
-_alert_last_seen: dict[tuple, datetime] = {}
+# Bounded OrderedDict — oldest entries evicted when ALERT_DEDUP_MAX is reached.
+# At country scale (100k nodes × 5 alert types = 500k potential keys) this caps
+# memory at roughly ALERT_DEDUP_MAX × ~120 bytes ≈ 6 MB at the default 50,000.
+_alert_last_seen: OrderedDict[tuple, datetime] = OrderedDict()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -166,11 +176,29 @@ def _inc_global(fields: dict, now: datetime):
     )
 
 def _alert_is_duplicate(node_id: str, alert_type: str) -> bool:
-    key  = (node_id, alert_type)
-    last = _alert_last_seen.get(key)
-    if last and (now_utc() - last).total_seconds() < ALERT_DEDUP_WINDOW:
-        return True
-    _alert_last_seen[key] = now_utc()
+    """
+    Returns True if the same alert from this node was published within ALERT_DEDUP_WINDOW.
+    Uses a bounded OrderedDict (LRU-style): when ALERT_DEDUP_MAX entries are reached,
+    the oldest entry is evicted. Evicted entries are forgotten — a very old node that
+    resurfaces will get one fresh alert publication, which is correct behaviour.
+    """
+    key = (node_id, alert_type)
+    now = now_utc()
+
+    if key in _alert_last_seen:
+        last = _alert_last_seen[key]
+        _alert_last_seen.move_to_end(key)   # refresh recency
+        if (now - last).total_seconds() < ALERT_DEDUP_WINDOW:
+            return True
+
+    # Record this publication (insert or update)
+    _alert_last_seen[key] = now
+    _alert_last_seen.move_to_end(key)
+
+    # Evict oldest entry if over capacity
+    while len(_alert_last_seen) > ALERT_DEDUP_MAX:
+        _alert_last_seen.popitem(last=False)
+
     return False
 
 def _seed_water_levels():
@@ -660,6 +688,8 @@ def _route(topic: str, raw: str):
         log.warning(f"JSON parse error on {topic}: {e}")
         return
 
+    # Broker delivers shared-subscription topics with the original filter path,
+    # not the $share/group prefix, so parts are always: floodwatch/village/type/...
     parts = topic.split("/")
     # parts: floodwatch / {village} / {msg_type} [/ {node_id} [/ status]]
     if len(parts) < 3:

@@ -55,6 +55,8 @@ jobs:
             REDIS_URL=${{ secrets.REDIS_URL }}
             NODE_OFFLINE_TIMEOUT=60
             ALERT_DEDUP_WINDOW=60
+            ALERT_DEDUP_MAX=50000
+            MQTT_SHARE_GROUP=parsers
             EOF
 
             docker stop floodwatch-parser 2>/dev/null || true
