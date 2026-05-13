@@ -57,6 +57,7 @@ jobs:
             ALERT_DEDUP_WINDOW=60
             ALERT_DEDUP_MAX=50000
             MQTT_SHARE_GROUP=parsers
+            WORKER_THREADS=4
             EOF
 
             docker stop floodwatch-parser 2>/dev/null || true

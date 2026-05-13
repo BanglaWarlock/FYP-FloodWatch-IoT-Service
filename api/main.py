@@ -9,7 +9,7 @@ REST endpoints:
   GET  /api/v1/villages/{village_id}      single village with topology
   GET  /api/v1/nodes                      all river nodes (?village_id, ?status)
   GET  /api/v1/nodes/{node_id}            single river node live state
-  GET  /api/v1/nodes/{node_id}/readings   paginated sensor history
+  GET  /api/v1/nodes/{node_id}/readings   paginated heartbeat history
   GET  /api/v1/alerts                     paginated alerts (?village_id, ?node_id, ?alert_type)
   GET  /api/v1/events/history             paginated event log (?event_type, ?node_id, ?village_id)
   GET  /api/v1/events/stream              SSE live stream (?types=heartbeat,flood_level,...)
@@ -59,7 +59,7 @@ col_global   = db["global_stats"]
 col_villages = db["villages"]
 col_masters  = db["master_nodes"]
 col_rivers   = db["river_nodes"]
-col_readings = db["sensor_readings"]
+col_heartbeats = db["heartbeats"]
 col_alerts   = db["alerts"]
 col_events   = db["events"]
 
@@ -209,7 +209,7 @@ def node_readings(
     if gps_only:
         query["gps_fix"] = True
     skip   = (page - 1) * page_size
-    cursor = col_readings.find(query).sort("timestamp", DESCENDING).skip(skip).limit(page_size)
+    cursor = col_heartbeats.find(query).sort("timestamp", DESCENDING).skip(skip).limit(page_size)
     data   = [_clean(d) for d in cursor]
     if not data and page == 1:
         raise HTTPException(404, f"Node '{node_id}' not found")
