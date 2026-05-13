@@ -14,6 +14,9 @@ REST endpoints:
   GET  /api/v1/alerts                       paginated alerts (?village_id, ?node_id, ?alert_type, ?from, ?to)
   GET  /api/v1/weather/{village_id}         paginated weather history (?from, ?to)
   GET  /api/v1/weather/{village_id}/at      weather valid at a specific moment (?t=<iso>)
+  GET  /api/v1/nodes/{node_id}/summary      avg/min/max water level + alerts (?period, ?from, ?to)
+  GET  /api/v1/villages/{village_id}/summary per-node breakdown + village totals (?period, ?from, ?to)
+  GET  /api/v1/stats/summary                global totals, top nodes, top villages (?period, ?from, ?to)
   GET  /api/v1/events/history               paginated event log (?event_type, ?node_id, ?village_id)
   GET  /api/v1/events/stream                SSE live stream (?types=heartbeat,flood_level,...)
 
@@ -39,7 +42,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import redis.asyncio as aioredis
 from bson import ObjectId
@@ -144,6 +147,32 @@ def _clean(value):
     if isinstance(value, ObjectId):
         return str(value)
     return value
+
+
+def _period_range(period: str | None, from_: str | None, to: str | None) -> tuple[datetime | None, datetime | None]:
+    """
+    Resolve a (start, end) UTC datetime pair from either a named period shorthand
+    or explicit from/to strings.  Returns (None, None) if no filter is requested.
+
+    period shorthands:
+      today   — midnight UTC today → now
+      week    — 7 days ago → now
+      month   — 30 days ago → now
+    """
+    if period:
+        now   = datetime.now(timezone.utc)
+        delta = {"today": timedelta(days=1), "week": timedelta(weeks=1), "month": timedelta(days=30)}
+        if period not in delta:
+            raise HTTPException(400, f"Invalid period '{period}'. Use: today | week | month")
+        start = (now.replace(hour=0, minute=0, second=0, microsecond=0)
+                 if period == "today" else now - delta[period])
+        return start, now
+    if from_ or to:
+        return (
+            _parse_dt(from_, "from") if from_ else None,
+            _parse_dt(to,    "to")   if to    else None,
+        )
+    return None, None
 
 
 def _parse_dt(s: str, param: str) -> datetime:
@@ -346,6 +375,207 @@ def get_weather_history(
     if not data and page == 1:
         raise HTTPException(404, f"No weather history for village '{village_id}'")
     return {"village_id": village_id, "page": page, "page_size": page_size, "data": data}
+
+
+# ── Summaries ─────────────────────────────────────────────────────────────────
+
+_PERIOD_DESC = "Shorthand: today | week | month. Overrides from/to if both supplied."
+
+
+@app.get("/api/v1/nodes/{node_id}/summary", tags=["summary"])
+def node_summary(
+    node_id: str,
+    period:  str = Query(default=None, description=_PERIOD_DESC),
+    from_:   str = Query(default=None, alias="from", description="ISO 8601 start time"),
+    to:      str = Query(default=None,               description="ISO 8601 end time"),
+):
+    """
+    Aggregate summary for a single river node over a time period.
+    Returns avg/min/max water level, avg battery voltage, reading count, and alert breakdown.
+    Use ?period=today|week|month or explicit ?from=...&to=... for custom ranges.
+    If no period is given, summarises all-time data.
+    """
+    if not col_rivers.find_one({"node_id": node_id}, {"_id": 1}):
+        raise HTTPException(404, f"Node '{node_id}' not found")
+
+    start, end = _period_range(period, from_, to)
+    ts_match: dict = {"node_id": node_id}
+    if start or end:
+        ts_filter: dict = {}
+        if start: ts_filter["$gte"] = start
+        if end:   ts_filter["$lte"] = end
+        ts_match["timestamp"] = ts_filter
+
+    pipeline = [
+        {"$match": ts_match},
+        {"$group": {
+            "_id":             None,
+            "reading_count":   {"$sum": 1},
+            "avg_water_level": {"$avg": "$water_level"},
+            "min_water_level": {"$min": "$water_level"},
+            "max_water_level": {"$max": "$water_level"},
+            "avg_battery_v":   {"$avg": "$battery_voltage"},
+            "min_battery_v":   {"$min": "$battery_voltage"},
+            "first_reading":   {"$min": "$timestamp"},
+            "last_reading":    {"$max": "$timestamp"},
+        }},
+    ]
+    result = next(col_heartbeats.aggregate(pipeline), {})
+    result.pop("_id", None)
+
+    alert_match: dict = {"node_id": node_id}
+    if start or end:
+        alert_match["timestamp"] = ts_match.get("timestamp", {})
+    alert_pipeline = [
+        {"$match": alert_match},
+        {"$group": {"_id": "$alert_type", "count": {"$sum": 1}}},
+    ]
+    alerts_by_type = {r["_id"]: r["count"] for r in col_alerts.aggregate(alert_pipeline)}
+
+    return {
+        "node_id":       node_id,
+        "period":        period or "all_time",
+        "from":          start.isoformat() if start else None,
+        "to":            end.isoformat()   if end   else None,
+        **_clean(result),
+        "total_alerts":  sum(alerts_by_type.values()),
+        "alerts_by_type": alerts_by_type,
+    }
+
+
+@app.get("/api/v1/villages/{village_id}/summary", tags=["summary"])
+def village_summary(
+    village_id: str,
+    period:     str = Query(default=None, description=_PERIOD_DESC),
+    from_:      str = Query(default=None, alias="from", description="ISO 8601 start time"),
+    to:         str = Query(default=None,               description="ISO 8601 end time"),
+):
+    """
+    Aggregate summary for all nodes in a village over a time period.
+    Returns per-node and village-wide avg/min/max water level, battery, reading count,
+    and alert breakdown by type.
+    """
+    if not col_villages.find_one({"village_id": village_id}, {"_id": 1}):
+        raise HTTPException(404, f"Village '{village_id}' not found")
+
+    start, end = _period_range(period, from_, to)
+    ts_match: dict = {"village_id": village_id}
+    if start or end:
+        ts_filter: dict = {}
+        if start: ts_filter["$gte"] = start
+        if end:   ts_filter["$lte"] = end
+        ts_match["timestamp"] = ts_filter
+
+    pipeline = [
+        {"$match": ts_match},
+        {"$group": {
+            "_id":             "$node_id",
+            "reading_count":   {"$sum": 1},
+            "avg_water_level": {"$avg": "$water_level"},
+            "min_water_level": {"$min": "$water_level"},
+            "max_water_level": {"$max": "$water_level"},
+            "avg_battery_v":   {"$avg": "$battery_voltage"},
+            "min_battery_v":   {"$min": "$battery_voltage"},
+            "first_reading":   {"$min": "$timestamp"},
+            "last_reading":    {"$max": "$timestamp"},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+    nodes = []
+    total_readings = 0
+    for r in col_heartbeats.aggregate(pipeline):
+        node_id = r.pop("_id")
+        total_readings += r.get("reading_count", 0)
+        nodes.append({"node_id": node_id, **_clean(r)})
+
+    alert_match: dict = {"village_id": village_id}
+    if start or end:
+        alert_match["timestamp"] = ts_match.get("timestamp", {})
+    alert_pipeline = [
+        {"$match": alert_match},
+        {"$group": {"_id": "$alert_type", "count": {"$sum": 1}}},
+    ]
+    alerts_by_type = {r["_id"]: r["count"] for r in col_alerts.aggregate(alert_pipeline)}
+
+    return {
+        "village_id":    village_id,
+        "period":        period or "all_time",
+        "from":          start.isoformat() if start else None,
+        "to":            end.isoformat()   if end   else None,
+        "total_readings": total_readings,
+        "total_alerts":  sum(alerts_by_type.values()),
+        "alerts_by_type": alerts_by_type,
+        "nodes":         nodes,
+    }
+
+
+@app.get("/api/v1/stats/summary", tags=["summary"])
+def global_summary(
+    period: str = Query(default=None, description=_PERIOD_DESC),
+    from_:  str = Query(default=None, alias="from", description="ISO 8601 start time"),
+    to:     str = Query(default=None,               description="ISO 8601 end time"),
+):
+    """
+    Global aggregate summary across all villages and nodes.
+    Returns total readings, alert breakdown by type, most active nodes and villages,
+    and peak water level recorded.
+    """
+    start, end = _period_range(period, from_, to)
+    ts_filter: dict = {}
+    if start: ts_filter["$gte"] = start
+    if end:   ts_filter["$lte"] = end
+    hb_match  = {"timestamp": ts_filter} if ts_filter else {}
+    alt_match = {"timestamp": ts_filter} if ts_filter else {}
+
+    # Total readings + peak water level
+    hb_pipeline = [
+        {"$match": hb_match},
+        {"$group": {
+            "_id":             None,
+            "total_readings":  {"$sum": 1},
+            "peak_water_level": {"$max": "$water_level"},
+        }},
+    ]
+    hb_result = next(col_heartbeats.aggregate(hb_pipeline), {})
+    hb_result.pop("_id", None)
+
+    # Alerts by type
+    alert_pipeline = [
+        {"$match": alt_match},
+        {"$group": {"_id": "$alert_type", "count": {"$sum": 1}}},
+    ]
+    alerts_by_type = {r["_id"]: r["count"] for r in col_alerts.aggregate(alert_pipeline)}
+
+    # Top 5 most active nodes by reading count
+    top_nodes_pipeline = [
+        {"$match": hb_match},
+        {"$group": {"_id": "$node_id", "readings": {"$sum": 1}}},
+        {"$sort": {"readings": -1}},
+        {"$limit": 5},
+    ]
+    top_nodes = [{"node_id": r["_id"], "readings": r["readings"]}
+                 for r in col_heartbeats.aggregate(top_nodes_pipeline)]
+
+    # Top 5 most alerted villages
+    top_villages_pipeline = [
+        {"$match": alt_match},
+        {"$group": {"_id": "$village_id", "alerts": {"$sum": 1}}},
+        {"$sort": {"alerts": -1}},
+        {"$limit": 5},
+    ]
+    top_villages = [{"village_id": r["_id"], "alerts": r["alerts"]}
+                    for r in col_alerts.aggregate(top_villages_pipeline)]
+
+    return {
+        "period":          period or "all_time",
+        "from":            start.isoformat() if start else None,
+        "to":              end.isoformat()   if end   else None,
+        **_clean(hb_result),
+        "total_alerts":    sum(alerts_by_type.values()),
+        "alerts_by_type":  alerts_by_type,
+        "top_active_nodes": top_nodes,
+        "top_alerted_villages": top_villages,
+    }
 
 
 # ── Event log ─────────────────────────────────────────────────────────────────
