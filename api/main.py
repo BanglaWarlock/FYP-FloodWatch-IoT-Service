@@ -2,6 +2,11 @@
 """
 FloodWatch API v2  —  FastAPI + SSE
 
+All data endpoints accept ?dataset=real|sample|all (default: real).
+  real   — live sensor data only (default)
+  sample — pre-generated demo data only (is_sample: true)
+  all    — both together (for side-by-side comparison)
+
 REST endpoints:
   GET  /                                    health check
   GET  /api/v1/stats                        global aggregate counters
@@ -18,7 +23,7 @@ REST endpoints:
   GET  /api/v1/villages/{village_id}/summary per-node breakdown + village totals (?period, ?from, ?to)
   GET  /api/v1/stats/summary                global totals, top nodes, top villages (?period, ?from, ?to)
   GET  /api/v1/events/history               paginated event log (?event_type, ?node_id, ?village_id)
-  GET  /api/v1/events/stream                SSE live stream (?types=heartbeat,flood_level,...)
+  GET  /api/v1/events/stream                SSE live stream (?types=..., ?dataset=real|sample|all)
 
 SSE event types:
   heartbeat      — every sensor reading
@@ -134,7 +139,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Serialiser ────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_DATASET_DESC = (
+    "real (default) — live sensor data only  |  "
+    "sample — pre-generated demo data only  |  "
+    "all — both together"
+)
+
+
+def _dataset_filter(dataset: str) -> dict:
+    """
+    Return a MongoDB filter fragment based on the requested dataset.
+    Real documents never have is_sample set; sample documents always have is_sample: true.
+    """
+    if dataset == "real":
+        return {"is_sample": {"$ne": True}}
+    if dataset == "sample":
+        return {"is_sample": True}
+    if dataset == "all":
+        return {}
+    raise HTTPException(400, f"Invalid dataset '{dataset}'. Use: real | sample | all")
+
 
 def _clean(value):
     """Recursively strip _id, convert datetimes to ISO strings, ObjectIds to str."""
@@ -149,15 +175,15 @@ def _clean(value):
     return value
 
 
-def _period_range(period: str | None, from_: str | None, to: str | None) -> tuple[datetime | None, datetime | None]:
+def _period_range(
+    period: str | None, from_: str | None, to: str | None
+) -> tuple[datetime | None, datetime | None]:
     """
-    Resolve a (start, end) UTC datetime pair from either a named period shorthand
-    or explicit from/to strings.  Returns (None, None) if no filter is requested.
-
-    period shorthands:
-      today   — midnight UTC today → now
-      week    — 7 days ago → now
-      month   — 30 days ago → now
+    Resolve a (start, end) UTC datetime pair from a named shorthand or explicit strings.
+    Returns (None, None) if no filter is requested.
+      today — midnight UTC today → now
+      week  — 7 days ago → now
+      month — 30 days ago → now
     """
     if period:
         now   = datetime.now(timezone.utc)
@@ -183,7 +209,13 @@ def _parse_dt(s: str, param: str) -> datetime:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
     except ValueError:
-        raise HTTPException(400, f"Invalid datetime for '{param}': '{s}'. Use ISO 8601, e.g. 2026-05-14T06:00:00Z")
+        raise HTTPException(
+            400,
+            f"Invalid datetime for '{param}': '{s}'. Use ISO 8601, e.g. 2026-05-14T06:00:00Z",
+        )
+
+
+_PERIOD_DESC = "Shorthand: today | week | month. Overrides from/to if both supplied."
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -196,32 +228,51 @@ def health():
 # ── Global stats ──────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/stats", tags=["stats"])
-def get_stats():
+def get_stats(
+    dataset: str = Query(default="real", description=_DATASET_DESC),
+):
     """
-    Single-document aggregate counters — total nodes, villages, alerts by type, etc.
-    Always O(1) — the parser keeps this updated atomically.
-    Live online/offline counts are augmented from river_nodes for accuracy.
+    Aggregate counters — total nodes, villages, alerts by type, etc.
+    For dataset=real the pre-computed global_stats document is used (O(1)).
+    For dataset=sample or all, counts are computed live from the collections.
     """
-    doc = col_global.find_one({"_id": "global"}) or {}
-    doc.pop("_id", None)
-    doc["nodes_online"]  = col_rivers.count_documents({"status": "online"})
-    doc["nodes_offline"] = col_rivers.count_documents({"status": "offline"})
+    df = _dataset_filter(dataset)
+
+    if dataset == "real":
+        doc = col_global.find_one({"_id": "global"}) or {}
+        doc.pop("_id", None)
+    else:
+        doc = {
+            "total_villages":   col_villages.count_documents(df),
+            "total_river_nodes": col_rivers.count_documents(df),
+            "total_alerts":     col_alerts.count_documents(df),
+        }
+
+    doc["nodes_online"]  = col_rivers.count_documents({**df, "status": "online"})
+    doc["nodes_offline"] = col_rivers.count_documents({**df, "status": "offline"})
     return _clean(doc)
 
 
 # ── Villages ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/villages", tags=["villages"])
-def list_villages():
+def list_villages(
+    dataset: str = Query(default="real", description=_DATASET_DESC),
+):
     """All villages with summary fields. Topology and weather forecast excluded."""
-    docs = col_villages.find({}, {"topology": 0, "weather_forecast": 0})
+    df   = _dataset_filter(dataset)
+    docs = col_villages.find(df, {"topology": 0, "weather_forecast": 0})
     return [_clean(d) for d in docs]
 
 
 @app.get("/api/v1/villages/{village_id}", tags=["villages"])
-def get_village(village_id: str):
+def get_village(
+    village_id: str,
+    dataset:    str = Query(default="real", description=_DATASET_DESC),
+):
     """Single village with full topology, current weather, and 24h forecast."""
-    doc = col_villages.find_one({"village_id": village_id})
+    df  = _dataset_filter(dataset)
+    doc = col_villages.find_one({"village_id": village_id, **df})
     if not doc:
         raise HTTPException(404, f"Village '{village_id}' not found")
     return _clean(doc)
@@ -232,9 +283,11 @@ def get_village(village_id: str):
 @app.get("/api/v1/masters", tags=["masters"])
 def list_masters(
     village_id: str = Query(default=None, description="Filter by village"),
+    dataset:    str = Query(default="real", description=_DATASET_DESC),
 ):
     """All master nodes with current status."""
-    query: dict = {}
+    df    = _dataset_filter(dataset)
+    query = {**df}
     if village_id:
         query["village_id"] = village_id
     return [_clean(d) for d in col_masters.find(query)]
@@ -246,9 +299,11 @@ def list_masters(
 def list_nodes(
     village_id: str = Query(default=None, description="Filter by village"),
     status:     str = Query(default=None, description="online | offline"),
+    dataset:    str = Query(default="real", description=_DATASET_DESC),
 ):
     """All river nodes with current live state."""
-    query: dict = {}
+    df    = _dataset_filter(dataset)
+    query = {**df}
     if village_id:
         query["village_id"] = village_id
     if status:
@@ -257,9 +312,13 @@ def list_nodes(
 
 
 @app.get("/api/v1/nodes/{node_id}", tags=["nodes"])
-def get_node(node_id: str):
+def get_node(
+    node_id: str,
+    dataset: str = Query(default="real", description=_DATASET_DESC),
+):
     """Single river node — current live state."""
-    doc = col_rivers.find_one({"node_id": node_id})
+    df  = _dataset_filter(dataset)
+    doc = col_rivers.find_one({"node_id": node_id, **df})
     if not doc:
         raise HTTPException(404, f"Node '{node_id}' not found")
     return _clean(doc)
@@ -273,12 +332,14 @@ def node_readings(
     gps_only:  bool = Query(default=False, description="Only return readings with a GPS fix"),
     from_:     str  = Query(default=None, alias="from", description="ISO 8601 start time (inclusive)"),
     to:        str  = Query(default=None,               description="ISO 8601 end time (inclusive)"),
+    dataset:   str  = Query(default="real", description=_DATASET_DESC),
 ):
     """
     Paginated heartbeat history for a node (newest first).
     Optionally filter by time range with `from` and `to` (ISO 8601).
     """
-    query: dict = {"node_id": node_id}
+    df    = _dataset_filter(dataset)
+    query = {"node_id": node_id, **df}
     if gps_only:
         query["gps_fix"] = True
     if from_ or to:
@@ -290,7 +351,7 @@ def node_readings(
     cursor = col_heartbeats.find(query).sort("timestamp", DESCENDING).skip(skip).limit(page_size)
     data   = [_clean(d) for d in cursor]
     if not data and page == 1:
-        if not col_rivers.find_one({"node_id": node_id}, {"_id": 1}):
+        if not col_rivers.find_one({"node_id": node_id, **df}, {"_id": 1}):
             raise HTTPException(404, f"Node '{node_id}' not found")
     return {"node_id": node_id, "page": page, "page_size": page_size, "data": data}
 
@@ -306,13 +367,15 @@ def list_alerts(
     to:         str = Query(default=None,               description="ISO 8601 end time (inclusive)"),
     page:       int = Query(default=1,  ge=1),
     page_size:  int = Query(default=50, ge=1, le=200),
+    dataset:    str = Query(default="real", description=_DATASET_DESC),
 ):
     """
     Paginated alert history. Newest first.
     Optionally filter by time range with `from` and `to` (ISO 8601).
     gps_moved alerts include dist_m, lat/lng (current), home_lat/home_lng (install position).
     """
-    query: dict = {}
+    df    = _dataset_filter(dataset)
+    query = {**df}
     if village_id:  query["village_id"]  = village_id
     if node_id:     query["node_id"]     = node_id
     if alert_type:  query["alert_type"]  = alert_type
@@ -331,16 +394,18 @@ def list_alerts(
 @app.get("/api/v1/weather/{village_id}/at", tags=["weather"])
 def get_weather_at(
     village_id: str,
-    t: str = Query(..., description="ISO 8601 datetime — returns the weather record valid at that moment"),
+    t:       str = Query(..., description="ISO 8601 datetime — returns the weather record valid at that moment"),
+    dataset: str = Query(default="real", description=_DATASET_DESC),
 ):
     """
-    Returns the single weather record that was valid at time `t` for a village.
+    Returns the single weather record valid at time `t` for a village.
     Uses last-known-value semantics: finds the most recent record with timestamp <= t.
     Useful for correlating historical sensor readings or alerts with weather conditions.
     """
-    at = _parse_dt(t, "t")
+    df  = _dataset_filter(dataset)
+    at  = _parse_dt(t, "t")
     doc = col_weather.find_one(
-        {"village_id": village_id, "timestamp": {"$lte": at}},
+        {"village_id": village_id, "timestamp": {"$lte": at}, **df},
         sort=[("timestamp", DESCENDING)],
     )
     if not doc:
@@ -355,6 +420,7 @@ def get_weather_history(
     to:         str = Query(default=None,               description="ISO 8601 end time (inclusive)"),
     page:       int = Query(default=1,  ge=1),
     page_size:  int = Query(default=48, ge=1, le=200),
+    dataset:    str = Query(default="real", description=_DATASET_DESC),
 ):
     """
     Paginated weather history for a village (newest first).
@@ -363,7 +429,8 @@ def get_weather_history(
     Optionally filter by time range with `from` and `to` (ISO 8601).
     Use villages/{village_id} for the latest snapshot + 24h forecast.
     """
-    query: dict = {"village_id": village_id}
+    df    = _dataset_filter(dataset)
+    query = {"village_id": village_id, **df}
     if from_ or to:
         ts_filter: dict = {}
         if from_: ts_filter["$gte"] = _parse_dt(from_, "from")
@@ -379,15 +446,13 @@ def get_weather_history(
 
 # ── Summaries ─────────────────────────────────────────────────────────────────
 
-_PERIOD_DESC = "Shorthand: today | week | month. Overrides from/to if both supplied."
-
-
 @app.get("/api/v1/nodes/{node_id}/summary", tags=["summary"])
 def node_summary(
     node_id: str,
     period:  str = Query(default=None, description=_PERIOD_DESC),
     from_:   str = Query(default=None, alias="from", description="ISO 8601 start time"),
     to:      str = Query(default=None,               description="ISO 8601 end time"),
+    dataset: str = Query(default="real", description=_DATASET_DESC),
 ):
     """
     Aggregate summary for a single river node over a time period.
@@ -395,19 +460,20 @@ def node_summary(
     Use ?period=today|week|month or explicit ?from=...&to=... for custom ranges.
     If no period is given, summarises all-time data.
     """
-    if not col_rivers.find_one({"node_id": node_id}, {"_id": 1}):
+    df = _dataset_filter(dataset)
+    if not col_rivers.find_one({"node_id": node_id, **df}, {"_id": 1}):
         raise HTTPException(404, f"Node '{node_id}' not found")
 
     start, end = _period_range(period, from_, to)
-    ts_match: dict = {"node_id": node_id}
+    hb_match: dict = {"node_id": node_id, **df}
     if start or end:
-        ts_filter: dict = {}
-        if start: ts_filter["$gte"] = start
-        if end:   ts_filter["$lte"] = end
-        ts_match["timestamp"] = ts_filter
+        ts: dict = {}
+        if start: ts["$gte"] = start
+        if end:   ts["$lte"] = end
+        hb_match["timestamp"] = ts
 
     pipeline = [
-        {"$match": ts_match},
+        {"$match": hb_match},
         {"$group": {
             "_id":             None,
             "reading_count":   {"$sum": 1},
@@ -423,22 +489,23 @@ def node_summary(
     result = next(col_heartbeats.aggregate(pipeline), {})
     result.pop("_id", None)
 
-    alert_match: dict = {"node_id": node_id}
-    if start or end:
-        alert_match["timestamp"] = ts_match.get("timestamp", {})
+    alt_match: dict = {"node_id": node_id, **df}
+    if "timestamp" in hb_match:
+        alt_match["timestamp"] = hb_match["timestamp"]
     alert_pipeline = [
-        {"$match": alert_match},
+        {"$match": alt_match},
         {"$group": {"_id": "$alert_type", "count": {"$sum": 1}}},
     ]
     alerts_by_type = {r["_id"]: r["count"] for r in col_alerts.aggregate(alert_pipeline)}
 
     return {
-        "node_id":       node_id,
-        "period":        period or "all_time",
-        "from":          start.isoformat() if start else None,
-        "to":            end.isoformat()   if end   else None,
+        "node_id":        node_id,
+        "period":         period or "all_time",
+        "from":           start.isoformat() if start else None,
+        "to":             end.isoformat()   if end   else None,
+        "dataset":        dataset,
         **_clean(result),
-        "total_alerts":  sum(alerts_by_type.values()),
+        "total_alerts":   sum(alerts_by_type.values()),
         "alerts_by_type": alerts_by_type,
     }
 
@@ -449,25 +516,27 @@ def village_summary(
     period:     str = Query(default=None, description=_PERIOD_DESC),
     from_:      str = Query(default=None, alias="from", description="ISO 8601 start time"),
     to:         str = Query(default=None,               description="ISO 8601 end time"),
+    dataset:    str = Query(default="real", description=_DATASET_DESC),
 ):
     """
     Aggregate summary for all nodes in a village over a time period.
     Returns per-node and village-wide avg/min/max water level, battery, reading count,
     and alert breakdown by type.
     """
-    if not col_villages.find_one({"village_id": village_id}, {"_id": 1}):
+    df = _dataset_filter(dataset)
+    if not col_villages.find_one({"village_id": village_id, **df}, {"_id": 1}):
         raise HTTPException(404, f"Village '{village_id}' not found")
 
     start, end = _period_range(period, from_, to)
-    ts_match: dict = {"village_id": village_id}
+    hb_match: dict = {"village_id": village_id, **df}
     if start or end:
-        ts_filter: dict = {}
-        if start: ts_filter["$gte"] = start
-        if end:   ts_filter["$lte"] = end
-        ts_match["timestamp"] = ts_filter
+        ts: dict = {}
+        if start: ts["$gte"] = start
+        if end:   ts["$lte"] = end
+        hb_match["timestamp"] = ts
 
     pipeline = [
-        {"$match": ts_match},
+        {"$match": hb_match},
         {"$group": {
             "_id":             "$node_id",
             "reading_count":   {"$sum": 1},
@@ -481,72 +550,72 @@ def village_summary(
         }},
         {"$sort": {"_id": 1}},
     ]
-    nodes = []
+    nodes          = []
     total_readings = 0
     for r in col_heartbeats.aggregate(pipeline):
         node_id = r.pop("_id")
         total_readings += r.get("reading_count", 0)
         nodes.append({"node_id": node_id, **_clean(r)})
 
-    alert_match: dict = {"village_id": village_id}
-    if start or end:
-        alert_match["timestamp"] = ts_match.get("timestamp", {})
-    alert_pipeline = [
-        {"$match": alert_match},
-        {"$group": {"_id": "$alert_type", "count": {"$sum": 1}}},
-    ]
-    alerts_by_type = {r["_id"]: r["count"] for r in col_alerts.aggregate(alert_pipeline)}
-
-    return {
-        "village_id":    village_id,
-        "period":        period or "all_time",
-        "from":          start.isoformat() if start else None,
-        "to":            end.isoformat()   if end   else None,
-        "total_readings": total_readings,
-        "total_alerts":  sum(alerts_by_type.values()),
-        "alerts_by_type": alerts_by_type,
-        "nodes":         nodes,
-    }
-
-
-@app.get("/api/v1/stats/summary", tags=["summary"])
-def global_summary(
-    period: str = Query(default=None, description=_PERIOD_DESC),
-    from_:  str = Query(default=None, alias="from", description="ISO 8601 start time"),
-    to:     str = Query(default=None,               description="ISO 8601 end time"),
-):
-    """
-    Global aggregate summary across all villages and nodes.
-    Returns total readings, alert breakdown by type, most active nodes and villages,
-    and peak water level recorded.
-    """
-    start, end = _period_range(period, from_, to)
-    ts_filter: dict = {}
-    if start: ts_filter["$gte"] = start
-    if end:   ts_filter["$lte"] = end
-    hb_match  = {"timestamp": ts_filter} if ts_filter else {}
-    alt_match = {"timestamp": ts_filter} if ts_filter else {}
-
-    # Total readings + peak water level
-    hb_pipeline = [
-        {"$match": hb_match},
-        {"$group": {
-            "_id":             None,
-            "total_readings":  {"$sum": 1},
-            "peak_water_level": {"$max": "$water_level"},
-        }},
-    ]
-    hb_result = next(col_heartbeats.aggregate(hb_pipeline), {})
-    hb_result.pop("_id", None)
-
-    # Alerts by type
+    alt_match: dict = {"village_id": village_id, **df}
+    if "timestamp" in hb_match:
+        alt_match["timestamp"] = hb_match["timestamp"]
     alert_pipeline = [
         {"$match": alt_match},
         {"$group": {"_id": "$alert_type", "count": {"$sum": 1}}},
     ]
     alerts_by_type = {r["_id"]: r["count"] for r in col_alerts.aggregate(alert_pipeline)}
 
-    # Top 5 most active nodes by reading count
+    return {
+        "village_id":     village_id,
+        "period":         period or "all_time",
+        "from":           start.isoformat() if start else None,
+        "to":             end.isoformat()   if end   else None,
+        "dataset":        dataset,
+        "total_readings": total_readings,
+        "total_alerts":   sum(alerts_by_type.values()),
+        "alerts_by_type": alerts_by_type,
+        "nodes":          nodes,
+    }
+
+
+@app.get("/api/v1/stats/summary", tags=["summary"])
+def global_summary(
+    period:  str = Query(default=None, description=_PERIOD_DESC),
+    from_:   str = Query(default=None, alias="from", description="ISO 8601 start time"),
+    to:      str = Query(default=None,               description="ISO 8601 end time"),
+    dataset: str = Query(default="real", description=_DATASET_DESC),
+):
+    """
+    Global aggregate summary across all villages and nodes.
+    Returns total readings, alert breakdown by type, most active nodes and villages,
+    and peak water level recorded.
+    """
+    df         = _dataset_filter(dataset)
+    start, end = _period_range(period, from_, to)
+    ts: dict   = {}
+    if start: ts["$gte"] = start
+    if end:   ts["$lte"] = end
+    hb_match  = {**df, "timestamp": ts} if ts else {**df}
+    alt_match = {**df, "timestamp": ts} if ts else {**df}
+
+    hb_pipeline = [
+        {"$match": hb_match},
+        {"$group": {
+            "_id":              None,
+            "total_readings":   {"$sum": 1},
+            "peak_water_level": {"$max": "$water_level"},
+        }},
+    ]
+    hb_result = next(col_heartbeats.aggregate(hb_pipeline), {})
+    hb_result.pop("_id", None)
+
+    alert_pipeline = [
+        {"$match": alt_match},
+        {"$group": {"_id": "$alert_type", "count": {"$sum": 1}}},
+    ]
+    alerts_by_type = {r["_id"]: r["count"] for r in col_alerts.aggregate(alert_pipeline)}
+
     top_nodes_pipeline = [
         {"$match": hb_match},
         {"$group": {"_id": "$node_id", "readings": {"$sum": 1}}},
@@ -556,7 +625,6 @@ def global_summary(
     top_nodes = [{"node_id": r["_id"], "readings": r["readings"]}
                  for r in col_heartbeats.aggregate(top_nodes_pipeline)]
 
-    # Top 5 most alerted villages
     top_villages_pipeline = [
         {"$match": alt_match},
         {"$group": {"_id": "$village_id", "alerts": {"$sum": 1}}},
@@ -567,13 +635,14 @@ def global_summary(
                     for r in col_alerts.aggregate(top_villages_pipeline)]
 
     return {
-        "period":          period or "all_time",
-        "from":            start.isoformat() if start else None,
-        "to":              end.isoformat()   if end   else None,
+        "period":               period or "all_time",
+        "from":                 start.isoformat() if start else None,
+        "to":                   end.isoformat()   if end   else None,
+        "dataset":              dataset,
         **_clean(hb_result),
-        "total_alerts":    sum(alerts_by_type.values()),
-        "alerts_by_type":  alerts_by_type,
-        "top_active_nodes": top_nodes,
+        "total_alerts":         sum(alerts_by_type.values()),
+        "alerts_by_type":       alerts_by_type,
+        "top_active_nodes":     top_nodes,
         "top_alerted_villages": top_villages,
     }
 
@@ -587,9 +656,11 @@ def event_history(
     village_id: str = Query(default=None),
     page:       int = Query(default=1,  ge=1),
     page_size:  int = Query(default=50, ge=1, le=200),
+    dataset:    str = Query(default="real", description=_DATASET_DESC),
 ):
     """Paginated log of online/offline and announce events (30-day TTL)."""
-    query: dict = {}
+    df    = _dataset_filter(dataset)
+    query = {**df}
     if event_type:  query["event_type"] = event_type
     if node_id:     query["node_id"]    = node_id
     if village_id:  query["village_id"] = village_id
@@ -603,13 +674,15 @@ def event_history(
 @app.get("/api/v1/events/stream", tags=["events"])
 async def sse_stream(
     request: Request,
-    types: str = Query(
+    types:   str = Query(
         default="heartbeat,flood_level,alert,node_online,node_offline,weather_update",
         description="Comma-separated event types, or 'all'.",
     ),
+    dataset: str = Query(default="real", description=_DATASET_DESC),
 ):
     """
     Server-Sent Events stream. Zero-latency fan-out from Redis Pub/Sub.
+    Use ?dataset=sample to stream simulation events, or ?dataset=all for both.
 
     ```js
     const es = new EventSource("/api/v1/events/stream");
@@ -621,6 +694,9 @@ async def sse_stream(
       heartbeat, flood_level, alert, node_online, node_offline,
       master_online, master_offline, node_announce, weather_update
     """
+    # Validate dataset early so the error surfaces before the stream opens
+    _dataset_filter(dataset)
+
     wanted = {t.strip() for t in types.split(",")} if types != "all" else None
     q: asyncio.Queue = asyncio.Queue(maxsize=256)
     _sse_clients.add(q)
@@ -634,6 +710,14 @@ async def sse_stream(
                     raw        = await asyncio.wait_for(q.get(), timeout=15.0)
                     event      = json.loads(raw)
                     event_type = event.get("type", "unknown")
+                    is_sample  = event.get("is_sample", False)
+
+                    # Dataset filter
+                    if dataset == "real"   and is_sample:
+                        continue
+                    if dataset == "sample" and not is_sample:
+                        continue
+
                     if wanted and event_type not in wanted:
                         continue
                     yield {"event": event_type, "data": raw}
