@@ -9,10 +9,11 @@ REST endpoints:
   GET  /api/v1/villages/{village_id}        single village with full topology + weather
   GET  /api/v1/nodes                        all river nodes (?village_id, ?status)
   GET  /api/v1/nodes/{node_id}              single river node live state
-  GET  /api/v1/nodes/{node_id}/readings     paginated heartbeat history
+  GET  /api/v1/nodes/{node_id}/readings     paginated heartbeat history (?from, ?to, ?gps_only)
   GET  /api/v1/masters                      all master nodes
-  GET  /api/v1/alerts                       paginated alerts (?village_id, ?node_id, ?alert_type)
-  GET  /api/v1/weather/{village_id}         paginated weather history (change-only records)
+  GET  /api/v1/alerts                       paginated alerts (?village_id, ?node_id, ?alert_type, ?from, ?to)
+  GET  /api/v1/weather/{village_id}         paginated weather history (?from, ?to)
+  GET  /api/v1/weather/{village_id}/at      weather valid at a specific moment (?t=<iso>)
   GET  /api/v1/events/history               paginated event log (?event_type, ?node_id, ?village_id)
   GET  /api/v1/events/stream                SSE live stream (?types=heartbeat,flood_level,...)
 
@@ -38,7 +39,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 from bson import ObjectId
@@ -145,6 +146,17 @@ def _clean(value):
     return value
 
 
+def _parse_dt(s: str, param: str) -> datetime:
+    """Parse an ISO 8601 datetime string into a timezone-aware UTC datetime."""
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        raise HTTPException(400, f"Invalid datetime for '{param}': '{s}'. Use ISO 8601, e.g. 2026-05-14T06:00:00Z")
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["health"])
@@ -230,11 +242,21 @@ def node_readings(
     page:      int  = Query(default=1,  ge=1),
     page_size: int  = Query(default=50, ge=1, le=200),
     gps_only:  bool = Query(default=False, description="Only return readings with a GPS fix"),
+    from_:     str  = Query(default=None, alias="from", description="ISO 8601 start time (inclusive)"),
+    to:        str  = Query(default=None,               description="ISO 8601 end time (inclusive)"),
 ):
-    """Paginated heartbeat history for a node (newest first)."""
+    """
+    Paginated heartbeat history for a node (newest first).
+    Optionally filter by time range with `from` and `to` (ISO 8601).
+    """
     query: dict = {"node_id": node_id}
     if gps_only:
         query["gps_fix"] = True
+    if from_ or to:
+        ts_filter: dict = {}
+        if from_: ts_filter["$gte"] = _parse_dt(from_, "from")
+        if to:    ts_filter["$lte"] = _parse_dt(to,    "to")
+        query["timestamp"] = ts_filter
     skip   = (page - 1) * page_size
     cursor = col_heartbeats.find(query).sort("timestamp", DESCENDING).skip(skip).limit(page_size)
     data   = [_clean(d) for d in cursor]
@@ -251,17 +273,25 @@ def list_alerts(
     village_id: str = Query(default=None),
     node_id:    str = Query(default=None),
     alert_type: str = Query(default=None, description="flood | battery | gps_signal_lost | gps_restored | gps_moved"),
+    from_:      str = Query(default=None, alias="from", description="ISO 8601 start time (inclusive)"),
+    to:         str = Query(default=None,               description="ISO 8601 end time (inclusive)"),
     page:       int = Query(default=1,  ge=1),
     page_size:  int = Query(default=50, ge=1, le=200),
 ):
     """
     Paginated alert history. Newest first.
+    Optionally filter by time range with `from` and `to` (ISO 8601).
     gps_moved alerts include dist_m, lat/lng (current), home_lat/home_lng (install position).
     """
     query: dict = {}
     if village_id:  query["village_id"]  = village_id
     if node_id:     query["node_id"]     = node_id
     if alert_type:  query["alert_type"]  = alert_type
+    if from_ or to:
+        ts_filter: dict = {}
+        if from_: ts_filter["$gte"] = _parse_dt(from_, "from")
+        if to:    ts_filter["$lte"] = _parse_dt(to,    "to")
+        query["timestamp"] = ts_filter
     skip   = (page - 1) * page_size
     cursor = col_alerts.find(query).sort("timestamp", DESCENDING).skip(skip).limit(page_size)
     return {"page": page, "page_size": page_size, "data": [_clean(d) for d in cursor]}
@@ -269,20 +299,49 @@ def list_alerts(
 
 # ── Weather history ───────────────────────────────────────────────────────────
 
+@app.get("/api/v1/weather/{village_id}/at", tags=["weather"])
+def get_weather_at(
+    village_id: str,
+    t: str = Query(..., description="ISO 8601 datetime — returns the weather record valid at that moment"),
+):
+    """
+    Returns the single weather record that was valid at time `t` for a village.
+    Uses last-known-value semantics: finds the most recent record with timestamp <= t.
+    Useful for correlating historical sensor readings or alerts with weather conditions.
+    """
+    at = _parse_dt(t, "t")
+    doc = col_weather.find_one(
+        {"village_id": village_id, "timestamp": {"$lte": at}},
+        sort=[("timestamp", DESCENDING)],
+    )
+    if not doc:
+        raise HTTPException(404, f"No weather record found for village '{village_id}' at or before {t}")
+    return _clean(doc)
+
+
 @app.get("/api/v1/weather/{village_id}", tags=["weather"])
 def get_weather_history(
     village_id: str,
+    from_:      str = Query(default=None, alias="from", description="ISO 8601 start time (inclusive)"),
+    to:         str = Query(default=None,               description="ISO 8601 end time (inclusive)"),
     page:       int = Query(default=1,  ge=1),
     page_size:  int = Query(default=48, ge=1, le=200),
 ):
     """
     Paginated weather history for a village (newest first).
-    Only records where at least one field changed from the previous poll are stored.
-    The last record represents current conditions until the next change.
+    Only records where at least one field changed from the previous poll are stored —
+    the last record before any gap represents conditions during that gap.
+    Optionally filter by time range with `from` and `to` (ISO 8601).
     Use villages/{village_id} for the latest snapshot + 24h forecast.
     """
+    query: dict = {"village_id": village_id}
+    if from_ or to:
+        ts_filter: dict = {}
+        if from_: ts_filter["$gte"] = _parse_dt(from_, "from")
+        if to:    ts_filter["$lte"] = _parse_dt(to,    "to")
+        query["timestamp"] = ts_filter
     skip   = (page - 1) * page_size
-    cursor = col_weather.find({"village_id": village_id}).sort("timestamp", DESCENDING).skip(skip).limit(page_size)
+    cursor = col_weather.find(query).sort("timestamp", DESCENDING).skip(skip).limit(page_size)
     data   = [_clean(d) for d in cursor]
     if not data and page == 1:
         raise HTTPException(404, f"No weather history for village '{village_id}'")
