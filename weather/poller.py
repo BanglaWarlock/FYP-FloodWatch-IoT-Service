@@ -246,7 +246,7 @@ def fetch_weather(lat: float, lng: float) -> tuple[dict, list] | None:
 
 def _poll_all():
     villages = list(col_villages.find(
-        {"lat": {"$exists": True}, "lng": {"$exists": True}},
+        {"lat": {"$exists": True}, "lng": {"$exists": True}, "is_sample": {"$ne": True}},
         {"village_id": 1, "lat": 1, "lng": 1}
     ))
 
