@@ -1,0 +1,64 @@
+name: Deploy simulator to AWS EC2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "simulator/**"
+      - ".github/workflows/deploy-simulator.yml"
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase image name
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/floodwatch-simulator:latest" >> $GITHUB_ENV
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push simulator image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./simulator
+          push: true
+          tags: ${{ env.IMAGE }}
+
+      - name: Deploy to AWS EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.AWS_EC2_HOST }}
+          username: ${{ secrets.AWS_EC2_USER }}
+          key:      ${{ secrets.AWS_EC2_SSH_KEY }}
+          script: |
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            docker pull ${{ env.IMAGE }}
+
+            sudo mkdir -p /opt/floodwatch
+            cat << 'EOF' | sudo tee /opt/floodwatch/simulator.env > /dev/null
+            MONGO_URI=${{ secrets.MONGO_URI }}
+            MONGO_DB=${{ secrets.MONGO_DB }}
+            REDIS_URL=${{ secrets.REDIS_URL }}
+            EOF
+
+            docker stop floodwatch-simulator 2>/dev/null || true
+            docker rm   floodwatch-simulator 2>/dev/null || true
+            docker run -d \
+              --name floodwatch-simulator \
+              --restart unless-stopped \
+              --env-file /opt/floodwatch/simulator.env \
+              ${{ env.IMAGE }}
+
+            echo "Simulator deployed — $(docker inspect --format='{{.State.Status}}' floodwatch-simulator)"
