@@ -332,8 +332,11 @@ def handle_alert(village: str, node_id: str, payload: dict, now: datetime):
     float_bits = payload.get("float_bits", 0)
     water_lvl  = compute_water_level(float_bits)
     bat        = payload.get("bat", 0.0)
+    dist       = payload.get("dist")      # metres moved; only present for gps_moved
     lat        = payload.get("lat", 0.0)
     lng        = payload.get("lng", 0.0)
+    home_lat   = payload.get("home_lat")  # install position; only present for gps_moved
+    home_lng   = payload.get("home_lng")
     gps_fix    = bool(payload.get("gps_fix", False))
     rssi       = payload.get("rssi")
     snr        = payload.get("snr")
@@ -358,8 +361,11 @@ def handle_alert(village: str, node_id: str, payload: dict, now: datetime):
         "float_bits":      float_bits if alert_type == "flood" else None,
         "water_level":     water_lvl  if alert_type == "flood" else None,
         "battery_voltage": round(bat, 2),
+        "dist_m":          dist if alert_type == "gps_moved" else None,
         "lat":             lat if (lat or lng) else None,
         "lng":             lng if (lat or lng) else None,
+        "home_lat":        home_lat if alert_type == "gps_moved" else None,
+        "home_lng":        home_lng if alert_type == "gps_moved" else None,
         "gps_fix":         gps_fix,
         "rssi":            rssi,
         "snr":             snr,
@@ -397,8 +403,11 @@ def handle_alert(village: str, node_id: str, payload: dict, now: datetime):
         "level":      level,
         "float_bits": float_bits,
         "bat":        round(bat, 2),
+        "dist_m":     dist,
         "lat":        lat,
         "lng":        lng,
+        "home_lat":   home_lat,
+        "home_lng":   home_lng,
         "gps_fix":    gps_fix,
         "rssi":       rssi,
         "timestamp":  ts,
